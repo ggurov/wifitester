@@ -141,6 +141,8 @@ th{color:var(--mut);font-weight:500}
 .card.c-o{border-left:4px solid #f97316}
 .card.c-bad{border-left:4px solid var(--bad)}
 .c-ok{color:var(--ok)}.c-w{color:var(--warn)}.c-o{color:#f97316}.c-bad{color:var(--bad)}
+.card a{color:var(--ok);text-decoration:none}
+.card a:hover{text-decoration:underline}
 .b-ok{background:#14321f;color:var(--ok)}
 .b-warn{background:#33260e;color:var(--warn)}
 .b-bad{background:#3a1414;color:var(--bad)}
@@ -201,7 +203,7 @@ function nodeCard(n){
  const border=cc?' '+cc:'';
  const t=n.total1h||0,m=n.missed1h||0;
  const lan=n.eth_mac?`<div class="sub mono">lan ${esc(n.eth_mac)}`+
-  (n.eth_ip?` @ ${esc(n.eth_ip)}`:'')+
+  (n.eth_ip?` @ <a href="http://${esc(n.eth_ip)}" target="_blank" rel="noopener">${esc(n.eth_ip)}</a>`:'')+
   (n.eth_conf&&n.eth_conf!=='exact'?` <span class="age">(${esc(n.eth_conf)})</span>`:'')+
   `</div>`:'';
  return `<div class="card${border}"><div class="k"><span class="badge ${cls}">${label}</span>
