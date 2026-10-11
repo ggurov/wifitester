@@ -75,8 +75,10 @@ class Store:
         self._lock = threading.Lock()
         self.db = sqlite3.connect(self.path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
+        # busy_timeout must precede journal_mode: WAL switch needs a brief
+        # exclusive lock, and the web unit may start concurrently
+        self.db.execute("PRAGMA busy_timeout=10000")
         self.db.execute("PRAGMA journal_mode=WAL")   # web readers + probe writer
-        self.db.execute("PRAGMA busy_timeout=5000")
         self.db.executescript(SCHEMA)
         self.db.commit()
 
