@@ -11,7 +11,8 @@ ExecStart=/usr/bin/python3 -m wifitester run --config /etc/wifitester/config.tom
 Restart=on-failure
 RestartSec=30
 ProtectSystem=full
-ProtectHome=yes
+# psk_file secrets live under /home (user preference); read-only suffices
+ProtectHome=read-only
 
 [Install]
 WantedBy=multi-user.target

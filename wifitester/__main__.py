@@ -171,30 +171,39 @@ def main(argv=None):
         description="Round-robin AP connectivity prober with RF classification")
     ap.add_argument("--version", action="version",
                     version=f"wifitester {__version__}")
-    ap.add_argument("-c", "--config", default=None,
-                    help="config.toml (default: /etc/wifitester/config.toml, "
-                         "then ./config.toml)")
-    ap.add_argument("-d", "--data", default="./data",
-                    help="datastore directory (default ./data)")
+    common = argparse.ArgumentParser(add_help=False)
+    # SUPPRESS: when the flag is absent at subcommand level, keep the
+    # top-level value instead of stomping it with a local default
+    common.add_argument("-c", "--config", default=argparse.SUPPRESS,
+                        help="config.toml (default: /etc/wifitester/config.toml, "
+                             "then ./config.toml)")
+    common.add_argument("-d", "--data", default=argparse.SUPPRESS,
+                        help="datastore directory (default ./data)")
+    ap.add_argument("-c", "--config", default=None, help=argparse.SUPPRESS)
+    ap.add_argument("-d", "--data", default="./data", help=argparse.SUPPRESS)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("validate", help="check config + environment").set_defaults(
-        fn=cmd_validate)
-    p = sub.add_parser("run", help="daemon loop")
+    def add(name, help, **kw):
+        p = sub.add_parser(name, parents=[common], help=help,
+                           description=help, **kw)
+        return p
+
+    add("validate", "check config + environment").set_defaults(fn=cmd_validate)
+    p = add("run", "daemon loop")
     p.add_argument("--once", action="store_true", help="one cycle, then exit")
     p.add_argument("--no-scan", action="store_true")
     p.set_defaults(fn=cmd_run)
-    p = sub.add_parser("probe", help="single AP visit + probe")
+    p = add("probe", "single AP visit + probe")
     p.add_argument("ssid")
     p.set_defaults(fn=cmd_probe)
-    p = sub.add_parser("scan", help="one scan + classification pass")
+    p = add("scan", "one scan + classification pass")
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_scan)
-    p = sub.add_parser("report", help="text report from the datastore")
+    p = add("report", "text report from the datastore")
     p.add_argument("--hours", type=float, default=24)
     p.add_argument("--limit", type=int, default=20)
     p.set_defaults(fn=cmd_report)
-    p = sub.add_parser("dashboard", help="write dashboard.html (graphs)")
+    p = add("dashboard", "write dashboard.html (graphs)")
     p.add_argument("--hours", type=float, default=24)
     p.set_defaults(fn=cmd_dashboard)
 
