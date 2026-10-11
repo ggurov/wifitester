@@ -12,6 +12,10 @@ log = logging.getLogger("wifitester.probe")
 
 _RTT = re.compile(r"time[=<]([\d.]+)\s*ms")
 
+# A single isolated ping miss is RF/ARP noise, not an outage: it only counts
+# as loss when part of a run of this many consecutive failures.
+MIN_CONSECUTIVE_LOSS = 2
+
 
 def ping_once(target, iface, timeout_s, deadline_ts=None):
     """One ICMP echo. Returns {'ok': bool, 'rtt_ms': float|None}."""
@@ -45,8 +49,17 @@ def probe_series(target, iface, count, interval_s, timeout_s, stop_event=None):
 
 
 def summarize(probes):
+    """Loss = probes that failed while part of a run of at least
+    MIN_CONSECUTIVE_LOSS consecutive failures. Isolated misses are excused."""
     sent = len(probes)
-    lost = sum(1 for p in probes if not p["ok"])
+    lost, run = 0, 0
+    for p in probes + [{"ok": True}]:  # sentinel flushes a trailing failed run
+        if p["ok"]:
+            if run >= MIN_CONSECUTIVE_LOSS:
+                lost += run
+            run = 0
+        else:
+            run += 1
     rtts = [p["rtt_ms"] for p in probes if p["ok"] and p["rtt_ms"] is not None]
     return {
         "sent": sent,
