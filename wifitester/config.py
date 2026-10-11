@@ -33,6 +33,7 @@ class Config:
     # All APs bridge to the same LAN: static addressing skips DHCP entirely.
     static_ipv4: str = ""          # e.g. "192.168.1.248/24"; "" = DHCP
     static_gateway: str = ""       # optional default route for the test iface
+    lan_sweep_interval_s: float = 300   # ARP/ping sweep for LAN MACs; 0=off
 
     probe_count: int = 3
     probe_interval_s: float = 0.4
@@ -93,6 +94,9 @@ def load(path) -> tuple[Config, list[str]]:
     cfg.require_wired_uplink = bool(_get(t, "require_wired_uplink", bool, errors, cfg.require_wired_uplink))
     cfg.static_ipv4 = str(_get(t, "static_ipv4", str, errors, cfg.static_ipv4))
     cfg.static_gateway = str(_get(t, "static_gateway", str, errors, cfg.static_gateway))
+    cfg.lan_sweep_interval_s = float(_get(t, "lan_sweep_interval_s", float, errors, cfg.lan_sweep_interval_s))
+    if cfg.lan_sweep_interval_s < 0:
+        errors.append("tester.lan_sweep_interval_s must be >= 0 (0 disables)")
     if cfg.static_ipv4 and not re.match(r"^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$",
                                         cfg.static_ipv4):
         errors.append(f"tester.static_ipv4 must be ip/prefix, "

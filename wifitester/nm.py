@@ -101,6 +101,19 @@ def wired_iface():
     return None
 
 
+def iface_cidr(iface):
+    """First IPv4 address/prefix on iface, e.g. '192.168.1.252/24'."""
+    out = run(["ip", "-j", "-4", "addr", "show", "dev", iface],
+              timeout=10, check=False).stdout
+    try:
+        for ifc in json.loads(out):
+            for a in ifc.get("addr_info", []):
+                return f"{a['local']}/{a['prefixlen']}"
+    except json.JSONDecodeError:
+        pass
+    return None
+
+
 def addr_assigned(ip):
     """True if ip is configured on any local interface."""
     out = run(["ip", "-j", "-4", "addr"], timeout=10, check=False).stdout
@@ -290,3 +303,48 @@ def key_mgmt_for(security):
     if "802.1X" in sec or "8021X" in sec:
         return "wpa-eap"
     return "wpa-psk"
+
+
+# --------------------------------------------------------------------------
+# LAN neighbor discovery (ethernet side, does not touch the test radio)
+
+def lan_hosts(cidr):
+    """All usable host IPs of a network like 192.168.1.248/24."""
+    import ipaddress
+    net = ipaddress.ip_interface(cidr).network
+    hosts = [str(h) for h in net.hosts()]
+    if not hosts:  # /32 or /31 edge cases
+        hosts = [str(net.network_address)]
+    return hosts
+
+
+def lan_sweep(hosts, iface, timeout_s=1.0, workers=64):
+    """Ping each host in parallel through iface, then read the kernel ARP
+    table. Returns {mac: ip} for hosts that answered. Does not touch wifi."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def ping(ip):
+        try:
+            subprocess.run(["ping", "-n", "-c", "1", "-W", "1",
+                            "-I", iface, ip],
+                           capture_output=True, timeout=timeout_s + 2)
+        except subprocess.TimeoutExpired:
+            pass
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(ping, hosts))
+    return neighbor_table(iface)
+
+
+def neighbor_table(iface):
+    """{mac: ip} currently in the kernel neighbor table for iface."""
+    out = run(["ip", "-j", "neigh", "show", "dev", iface],
+              timeout=10, check=False).stdout
+    res = {}
+    try:
+        for e in json.loads(out):
+            if e.get("lladdr"):
+                res[e["lladdr"].upper()] = e["dst"]
+    except json.JSONDecodeError:
+        pass
+    return res

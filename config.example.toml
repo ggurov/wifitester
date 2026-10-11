@@ -17,6 +17,7 @@ require_wired_uplink = true    # refuse to run without a non-wifi uplink
 # outside the DHCP pool; the tester arping-checks it at startup.
 static_ipv4 = "192.168.1.248/24"
 static_gateway = "192.168.1.1"
+lan_sweep_interval_s = 300    # ARP/ping sweep of the wired LAN every 5 min; 0=off
 
 [probe]
 count = 3                      # gateway pings per visit

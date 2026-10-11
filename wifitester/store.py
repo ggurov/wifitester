@@ -48,6 +48,12 @@ CREATE TABLE IF NOT EXISTS auth_attempts (
   classification TEXT,
   duration_ms INTEGER
 );
+CREATE TABLE IF NOT EXISTS lan_neigh (
+  mac TEXT PRIMARY KEY,
+  ip TEXT NOT NULL,
+  epoch REAL NOT NULL,
+  ts TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_visits_bssid ON visits(bssid, epoch);
 CREATE INDEX IF NOT EXISTS idx_visits_ssid ON visits(ssid, epoch);
 CREATE INDEX IF NOT EXISTS idx_scan_bssid ON scan_obs(bssid, epoch);
@@ -205,6 +211,45 @@ class Store:
               ON v.bssid=t.bssid AND v.epoch=t.m
             ORDER BY v.bssid
             """, (since_epoch,))
+
+    def hour_loss(self, since_epoch):
+        """Per-BSSID probe accounting in a window:
+        {bssid: {'sent':int,'lost':int,'conn_fails':int}}."""
+        rows = self._rows(
+            """
+            SELECT bssid,
+                   SUM(CASE WHEN connect_ok=1 THEN probes_sent ELSE 0 END) AS sent,
+                   SUM(CASE WHEN connect_ok=1 THEN probes_lost ELSE 0 END) AS lost,
+                   SUM(CASE WHEN connect_ok=0 THEN 1 ELSE 0 END) AS conn_fails
+            FROM visits
+            WHERE epoch>=? AND bssid IS NOT NULL
+            GROUP BY bssid
+            """, (since_epoch,))
+        return {r["bssid"]: {"sent": r["sent"] or 0, "lost": r["lost"] or 0,
+                             "conn_fails": r["conn_fails"] or 0}
+                for r in rows}
+
+    def replace_neighbors(self, pairs):
+        """Replace the LAN neighbor snapshot (mac, ip) from the last sweep."""
+        epoch, ts = now_pair()
+        with self._lock:
+            self.db.execute("DELETE FROM lan_neigh")
+            self.db.executemany(
+                "INSERT INTO lan_neigh(mac,ip,epoch,ts) VALUES (?,?,?,?)",
+                [(mac, ip, epoch, ts) for mac, ip in pairs])
+            self.db.commit()
+        return ts
+
+    def neighbors(self):
+        """{mac: ip} from the most recent LAN sweep."""
+        rows = self._rows("SELECT mac,ip FROM lan_neigh")
+        return {r["mac"].upper(): r["ip"] for r in rows}
+
+    def neighbors_age_s(self, now):
+        with self._lock:
+            row = self.db.execute(
+                "SELECT MAX(epoch) AS m FROM lan_neigh").fetchone()
+        return round(now - row["m"]) if row and row["m"] else None
 
     def event_feed(self, since_epoch, limit=30):
         """Recent anomalies: connect failures, loss, internet misses."""

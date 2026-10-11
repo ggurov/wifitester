@@ -243,17 +243,20 @@ class Runner:
     def run(self, once=False, do_scan=True):
         self.preflight()
         self._orig_connection = nm.current_connection(self.cfg.interface)
+        self._last_sweep = 0.0
         log.info("testing iface=%s, %d APs, cycle=%ss, scan=%ss; "
                  "original connection: %r", self.cfg.interface,
                  len([a for a in self.cfg.aps if a.enabled]),
                  self.cfg.cycle_interval_s, self.cfg.scan_interval_s,
                  self._orig_connection)
+        self.maybe_lan_sweep()  # neighbor table ready for the first sweep
         try:
             while not self.stop.is_set():
                 started = time.monotonic()
                 self.cycle()
                 if do_scan and not self.stop.is_set():
                     self.scan_pass()
+                self.maybe_lan_sweep()
                 if once:
                     break
                 wait = self.cfg.cycle_interval_s - (time.monotonic() - started)
@@ -261,6 +264,31 @@ class Runner:
                     self.stop.wait(wait)
         finally:
             self._restore()
+
+    def maybe_lan_sweep(self):
+        """Periodic ARP/ping sweep of the wired LAN so BSSIDs can be matched
+        to the ethernet MAC of their physical unit. Never touches wifi."""
+        if not self.cfg.lan_sweep_interval_s:
+            return
+        now = time.monotonic()
+        if now - getattr(self, "_last_sweep", 0) < self.cfg.lan_sweep_interval_s:
+            return
+        self._last_sweep = now
+        iface = nm.wired_iface()
+        if not iface:
+            log.warning("lan sweep skipped: no wired interface")
+            return
+        cidr = self.cfg.static_ipv4 or nm.iface_cidr(iface)
+        if not cidr:
+            log.warning("lan sweep skipped: no ipv4 on %s", iface)
+            return
+        try:
+            table = nm.lan_sweep(nm.lan_hosts(cidr), iface)
+            self.store.replace_neighbors(sorted(table.items()))
+            log.info("lan sweep via %s (%s): %d neighbors", iface, cidr,
+                     len(table))
+        except nm.CommandError as exc:
+            log.warning("lan sweep failed: %s", exc.stderr[:120])
 
     def _restore(self):
         if not self.cfg.restore_connection:

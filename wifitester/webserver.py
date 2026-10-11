@@ -7,7 +7,7 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import nm
+from . import ethmatch, nm
 
 log = logging.getLogger("wifitester.web")
 
@@ -31,7 +31,12 @@ def api_state(store, cfg, started):
         log.debug("live state unavailable: %s", exc)
 
     nodes = []
+    hour = store.hour_loss(now - 3600)
+    neigh = store.neighbors()
     for r in store.latest_visit_per_bssid(now - 86400):
+        h = hour.get(r["bssid"], {"sent": 0, "lost": 0, "conn_fails": 0})
+        pc = cfg.probe_count
+        eth_mac, eth_ip, eth_conf = ethmatch.match_eth(r["bssid"], neigh)
         nodes.append({
             "ssid": r["ssid"], "bssid": r["bssid"], "ts": r["ts"],
             "age_s": round(now - r["epoch"]),
@@ -41,6 +46,11 @@ def api_state(store, cfg, started):
             "loss_pct": r["loss_pct"], "avg_rtt_ms": r["avg_rtt_ms"],
             "internet_ok": None if r["internet_ok"] is None
             else bool(r["internet_ok"]),
+            # 1h probe accounting (missed includes failed associations at
+            # full probe count)
+            "total1h": h["sent"] + h["conn_fails"] * pc,
+            "missed1h": h["lost"] + h["conn_fails"] * pc,
+            "eth_mac": eth_mac, "eth_ip": eth_ip, "eth_conf": eth_conf,
         })
 
     events = []
@@ -126,6 +136,11 @@ th{color:var(--mut);font-weight:500}
 .badge{padding:1px 8px;border-radius:10px;font-size:12px;font-weight:600}
 .ssidtag{float:right;color:var(--mut);font-size:12px}
 .ssidtag b{color:var(--fg);font-weight:600}
+.card.c-ok{border-left:4px solid var(--ok)}
+.card.c-w{border-left:4px solid var(--warn)}
+.card.c-o{border-left:4px solid #f97316}
+.card.c-bad{border-left:4px solid var(--bad)}
+.c-ok{color:var(--ok)}.c-w{color:var(--warn)}.c-o{color:#f97316}.c-bad{color:var(--bad)}
 .b-ok{background:#14321f;color:var(--ok)}
 .b-warn{background:#33260e;color:var(--warn)}
 .b-bad{background:#3a1414;color:var(--bad)}
@@ -168,18 +183,33 @@ function ago(s){if(s<90)return s+'s';if(s<5400)return Math.round(s/60)+'m';
 if(s<172800)return Math.round(s/3600)+'h';return Math.round(s/86400)+'d'}
 function fmt(s){return s?esc(s.replace('T',' ').replace('Z','')):'-'}
 
+function lossBucket(n){
+ const t=n.total1h||0, m=n.missed1h||0;
+ if(t<=0)return'';
+ const r=m/t;
+ return r===0?'c-ok':r<=0.05?'c-w':r<=0.25?'c-o':'c-bad';
+}
 function nodeCard(n){
  let cls='b-bad',label='DOWN',txt=esc((n.connect_error||'connect failed').slice(0,70));
  if(n.connect_ok){
   if(n.loss_pct>=100){label='NO BACKHAUL';cls='b-bad';txt='assoc ok, zero probes pass'}
   else if(n.loss_pct>0){label='LOSS '+n.loss_pct+'%';cls='b-warn';txt='rtt '+n.avg_rtt_ms+'ms'}
-  else{label='OK';cls='b-ok';txt=(n.signal_dbm??'?')+' dBm &middot; rtt '+n.avg_rtt_ms+'ms'+
+  else{label='OK';cls='b-ok';txt=(n.signal_dbm??'?')+' dBm'+
    (n.internet_ok===false?' &middot; <span class=bad>WAN down</span>':'')}
  }
- return `<div class="card"><div class="k"><span class="badge ${cls}">${label}</span>
+ const cc=lossBucket(n);
+ const border=cc?' '+cc:'';
+ const t=n.total1h||0,m=n.missed1h||0;
+ const lan=n.eth_mac?`<div class="sub mono">lan ${esc(n.eth_mac)}`+
+  (n.eth_ip?` @ ${esc(n.eth_ip)}`:'')+
+  (n.eth_conf&&n.eth_conf!=='exact'?` <span class="age">(${esc(n.eth_conf)})</span>`:'')+
+  `</div>`:'';
+ return `<div class="card${border}"><div class="k"><span class="badge ${cls}">${label}</span>
  <span class="ssidtag">ssid: <b>${esc(n.ssid||'-')}</b></span></div>
  <div class="v mono">${esc(n.bssid||'-')}</div>
  <div class="sub">ch${n.chan??'-'} &middot; ${(n.signal_dbm??'?')} dBm &middot; rtt ${n.avg_rtt_ms??'-'}ms</div>
+ ${t>0?`<div class="sub ${cc}">1h: ${m}/${t} probes missed</div>`:''}
+ ${lan}
  <div class="sub">${txt}</div>
  <div class="sub">probed ${ago(n.age_s)} ago</div></div>`;
 }
