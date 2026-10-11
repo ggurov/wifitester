@@ -4,25 +4,33 @@
 
 [tester]
 interface = "wlan0"            # test radio
-cycle_interval_s = 300         # full sweep of all APs every 5 min
-settle_s = 3.0                 # wait after association for DHCP/route
-connect_timeout_s = 45         # nmcli con up timeout
+# Fast cadence to catch transient outages: sweeps run back-to-back, paced by
+# association time (~10-20s per AP visit on one radio).
+cycle_interval_s = 5           # min gap after a completed sweep
+settle_s = 1.5                 # wait after association for DHCP/route
+connect_timeout_s = 15         # nmcli con up timeout (offline APs cost this)
 restore_connection = true      # put the radio back on its original network
 require_wired_uplink = true    # refuse to run without a non-wifi uplink
 
 [probe]
-count = 5                      # gateway pings per visit
-interval_s = 2.0
-timeout_s = 2.0                # per-ping deadline
+count = 3                      # gateway pings per visit
+interval_s = 0.4
+timeout_s = 1.0                # per-ping deadline (transient blips show as loss)
 internet_target = "1.1.1.1"    # "" disables the WAN-hop check
 
 [scan]
-interval_s = 900               # scan+classify pass cadence (from `run`)
+interval_s = 600               # scan+classify pass cadence (from `run`)
 rescan = true                  # force an active scan, not cached results
                                # never | mismatch_only | all
 auth_probe = "mismatch_only"
 open_assoc = true              # try associating to unknown OPEN networks
 auth_timeout_s = 25            # per-BSSID association attempt deadline
+# Tip: pin verified BSSIDs in expected_bssids below -- pinned BSSIDs skip
+# auth probing and scan passes drop from ~2min to ~15s.
+
+[web]
+host = "0.0.0.0"               # status page: http://<pi-ip>:8787
+port = 8787
 
 # --- known access points ------------------------------------------------
 # expected_bssids: BSSIDs you have verified are yours. They are trusted and

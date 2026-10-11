@@ -7,7 +7,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import __version__, config, graph, nm, runner, store
+from . import __version__, config, graph, nm, runner, store, webserver
 
 
 def _data_dir(args):
@@ -165,6 +165,20 @@ def cmd_dashboard(args):
     return 0
 
 
+def cmd_serve(args):
+    cfg = _load_cfg(args.config)
+    st = _open_store(args)
+    host = args.host if args.host is not None else cfg.web_host
+    port = args.port if args.port is not None else cfg.web_port
+    try:
+        webserver.serve(st, cfg, host=host, port=port)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        st.close()
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         prog="wifitester",
@@ -206,6 +220,10 @@ def main(argv=None):
     p = add("dashboard", "write dashboard.html (graphs)")
     p.add_argument("--hours", type=float, default=24)
     p.set_defaults(fn=cmd_dashboard)
+    p = add("serve", "web UI (status page + JSON API)")
+    p.add_argument("--host", default=None)
+    p.add_argument("--port", type=int, default=None)
+    p.set_defaults(fn=cmd_serve)
 
     args = ap.parse_args(argv)
     if args.config is None:

@@ -8,6 +8,11 @@ stores everything in a local SQLite datastore with signal/loss graphs.
 Built on the [epicwolf](https://github.com/ggurov/epicwolf) template
 (`.wolf/` + `.claude/` agent-memory trees are vendored from it).
 
+**Live web UI**: `wifitester-web.service` serves a status page on
+`http://<pi-ip>:8787` — current association, per-AP health cards, signal and
+loss charts, event feed — polling the JSON API every 2s. No external
+dependencies; stdlib `http.server` + vanilla JS.
+
 ## What it does
 
 **Probe cycle** (`run`, or per-AP with `probe`): for each configured AP,
@@ -46,8 +51,13 @@ signal-strength-over-time, loss-per-visit, and neighbor-signal charts.
 
 ## Layout / safety
 
-- One radio = sequential visits; the config's `cycle_interval_s` sets sweep
-  cadence (each AP visit needs connect + settle + probe time, ~20 s).
+- One radio = sequential visits. Cadence is intentionally aggressive
+  (default: back-to-back sweeps, `cycle_interval_s = 5` — association time
+  alone paces it at ~10-20 s per AP) to catch transient outages. Each visit
+  fires 3 fast pings (1 s deadline) so sub-second blips surface as loss.
+- Offline configured APs cost `connect_timeout_s` (15 s) per sweep; pin
+  verified BSSIDs (`expected_bssids`) to keep scan passes ~15 s instead of
+  ~2 min of PSK auth attempts.
 - Tester-managed NetworkManager profiles are all named `wt-*`,
   `autoconnect=no`; your own profiles are never touched, and the original
   connection is restored when the tester stops (SIGINT/SIGTERM safe).
@@ -62,12 +72,13 @@ signal-strength-over-time, loss-per-visit, and neighbor-signal charts.
 ```bash
 git clone https://github.com/ggurov/wifitester.git
 cd wifitester
-sudo ./install.sh                       # code -> /opt, unit -> systemd
+sudo ./install.sh                       # code -> /opt, units -> systemd
 sudo nano /etc/wifitester/config.toml   # set psk_file per AP
 echo "$PSK" | sudo tee /etc/wifitester/psk/77fast5 && sudo chmod 600 /etc/wifitester/psk/77fast5
 wifitester validate
-sudo systemctl enable --now wifitester
+sudo systemctl enable --now wifitester wifitester-web
 journalctl -u wifitester -f
+# live status page: http://<pi-ip>:8787
 ```
 
 ## CLI
@@ -75,6 +86,7 @@ journalctl -u wifitester -f
 ```
 wifitester validate                 # config + environment check
 wifitester run [--once] [--no-scan] # daemon loop (probe cycle + scan passes)
+wifitester serve [--host H] [--port P]  # web UI + JSON API (default :8787)
 wifitester probe <ssid>             # one visit now, JSON record to stdout
 wifitester scan [--json]            # one scan + classification pass
 wifitester report [--hours 24]      # suspects / per-BSSID / neighbors / visits

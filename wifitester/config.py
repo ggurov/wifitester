@@ -25,22 +25,25 @@ class APConfig:
 @dataclass
 class Config:
     interface: str = "wlan0"
-    cycle_interval_s: float = 300
-    settle_s: float = 3.0
-    connect_timeout_s: float = 45
+    cycle_interval_s: float = 5
+    settle_s: float = 1.5
+    connect_timeout_s: float = 15
     restore_connection: bool = True
     require_wired_uplink: bool = True
 
-    probe_count: int = 5
-    probe_interval_s: float = 2.0
-    probe_timeout_s: float = 2.0
+    probe_count: int = 3
+    probe_interval_s: float = 0.4
+    probe_timeout_s: float = 1.0
     internet_target: str = "1.1.1.1"
 
-    scan_interval_s: float = 900
+    scan_interval_s: float = 600
     scan_rescan: bool = True
     auth_probe: str = "mismatch_only"  # never | mismatch_only | all
     open_assoc: bool = True
     auth_timeout_s: float = 25
+
+    web_host: str = "0.0.0.0"
+    web_port: int = 8787
 
     aps: list[APConfig] = field(default_factory=list)
 
@@ -139,12 +142,16 @@ def load(path) -> tuple[Config, list[str]]:
                     warns.append(f"[[ap]] {ssid}: psk unreadable ({exc})")
         cfg.aps.append(ap)
 
+    w = raw.get("web", {})
+    cfg.web_host = str(_get(w, "host", str, errors, cfg.web_host))
+    cfg.web_port = int(_get(w, "port", int, errors, cfg.web_port))
+
     if cfg.auth_probe not in ("never", "mismatch_only", "all"):
         errors.append(f"scan.auth_probe must be never|mismatch_only|all, "
                       f"got {cfg.auth_probe!r}")
-    if cfg.cycle_interval_s < 30:
-        warns.append(f"cycle_interval_s={cfg.cycle_interval_s} is aggressive; "
-                     "each visit needs connect+settle+probe time")
+    if cfg.cycle_interval_s < 2:
+        warns.append(f"cycle_interval_s={cfg.cycle_interval_s} leaves no gap "
+                     "between sweeps; association time alone paces the cycle")
     if cfg.probe_count < 1:
         errors.append("probe.count must be >= 1")
 

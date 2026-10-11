@@ -2,6 +2,7 @@
 attempt lands here on the Pi. Schema v1."""
 
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
@@ -64,8 +65,12 @@ class Store:
         self.dir = Path(data_dir)
         self.dir.mkdir(parents=True, exist_ok=True)
         self.path = self.dir / "wifitester.db"
-        self.db = sqlite3.connect(self.path)
+        # web server answers from worker threads; serialize all db use
+        self._lock = threading.Lock()
+        self.db = sqlite3.connect(self.path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
+        self.db.execute("PRAGMA journal_mode=WAL")   # web readers + probe writer
+        self.db.execute("PRAGMA busy_timeout=5000")
         self.db.executescript(SCHEMA)
         self.db.commit()
 
@@ -76,44 +81,54 @@ class Store:
 
     def insert_visit(self, rec):
         epoch, ts = now_pair()
-        self.db.execute(
-            "INSERT INTO visits(ts,epoch,ssid,bssid,chan,freq_mhz,signal_dbm,"
-            "gateway,connect_ok,connect_error,probes_sent,probes_lost,"
-            "loss_pct,avg_rtt_ms,max_rtt_ms,internet_ok) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (ts, epoch, rec.get("ssid"), rec.get("bssid"), rec.get("chan"),
-             rec.get("freq_mhz"), rec.get("signal_dbm"), rec.get("gateway"),
-             1 if rec.get("connect_ok") else 0, rec.get("connect_error"),
-             rec.get("sent"), rec.get("lost"), rec.get("loss_pct"),
-             rec.get("avg_rtt_ms"), rec.get("max_rtt_ms"),
-             None if rec.get("internet_ok") is None
-             else 1 if rec.get("internet_ok") else 0))
-        self.db.commit()
+        with self._lock:
+            self.db.execute(
+                "INSERT INTO visits(ts,epoch,ssid,bssid,chan,freq_mhz,"
+                "signal_dbm,gateway,connect_ok,connect_error,probes_sent,"
+                "probes_lost,loss_pct,avg_rtt_ms,max_rtt_ms,internet_ok) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (ts, epoch, rec.get("ssid"), rec.get("bssid"),
+                 rec.get("chan"), rec.get("freq_mhz"), rec.get("signal_dbm"),
+                 rec.get("gateway"), 1 if rec.get("connect_ok") else 0,
+                 rec.get("connect_error"), rec.get("sent"), rec.get("lost"),
+                 rec.get("loss_pct"), rec.get("avg_rtt_ms"),
+                 rec.get("max_rtt_ms"),
+                 None if rec.get("internet_ok") is None
+                 else 1 if rec.get("internet_ok") else 0))
+            self.db.commit()
 
     def insert_scan_pass(self, nets):
         """nets: dicts with ssid,bssid,chan,freq_mhz,signal,security,classification."""
         epoch, ts = now_pair()
-        self.db.executemany(
-            "INSERT INTO scan_obs(ts,epoch,ssid,bssid,chan,freq_mhz,"
-            "signal_pct,security,classification) VALUES (?,?,?,?,?,?,?,?,?)",
-            [(ts, epoch, n.get("ssid", ""), n["bssid"], n.get("chan"),
-              n.get("freq_mhz"), n.get("signal"), n.get("security"),
-              n.get("classification")) for n in nets])
-        self.db.commit()
+        with self._lock:
+            self.db.executemany(
+                "INSERT INTO scan_obs(ts,epoch,ssid,bssid,chan,freq_mhz,"
+                "signal_pct,security,classification) VALUES (?,?,?,?,?,?,?,?,?)",
+                [(ts, epoch, n.get("ssid", ""), n["bssid"], n.get("chan"),
+                  n.get("freq_mhz"), n.get("signal"), n.get("security"),
+                  n.get("classification")) for n in nets])
+            self.db.commit()
         return ts
 
     def insert_auth(self, ssid, bssid, result, classification, duration_ms):
         epoch, ts = now_pair()
-        self.db.execute(
-            "INSERT INTO auth_attempts(ts,epoch,ssid,bssid,result,"
-            "classification,duration_ms) VALUES (?,?,?,?,?,?,?)",
-            (ts, epoch, ssid, bssid, result, classification, duration_ms))
-        self.db.commit()
+        with self._lock:
+            self.db.execute(
+                "INSERT INTO auth_attempts(ts,epoch,ssid,bssid,result,"
+                "classification,duration_ms) VALUES (?,?,?,?,?,?,?)",
+                (ts, epoch, ssid, bssid, result, classification, duration_ms))
+            self.db.commit()
 
     # -- readers ----------------------------------------------------------
 
     def _rows(self, sql, args=()):
-        return self.db.execute(sql, args).fetchall()
+        with self._lock:
+            return self.db.execute(sql, args).fetchall()
+
+    def last_scan_epoch(self):
+        with self._lock:
+            row = self.db.execute("SELECT MAX(epoch) AS m FROM scan_obs").fetchone()
+        return row["m"] if row else None
 
     def signal_series(self, since_epoch):
         """Signal strength (dBm) per visit: (epoch, bssid, ssid, signal_dbm)."""
@@ -168,6 +183,30 @@ class Store:
         return self._rows(
             "SELECT * FROM visits WHERE epoch>=? ORDER BY epoch DESC LIMIT ?",
             (since_epoch, limit))
+
+    def latest_visit_per_ssid(self, since_epoch):
+        """Most recent visit row for each SSID (for status tables)."""
+        return self._rows(
+            """
+            SELECT v.* FROM visits v
+            JOIN (SELECT ssid, MAX(epoch) AS m FROM visits
+                  WHERE epoch>=? GROUP BY ssid) t
+              ON v.ssid=t.ssid AND v.epoch=t.m
+            ORDER BY v.ssid
+            """, (since_epoch,))
+
+    def event_feed(self, since_epoch, limit=30):
+        """Recent anomalies: connect failures, loss, internet misses."""
+        return self._rows(
+            """
+            SELECT ts, epoch, ssid, bssid, signal_dbm, connect_ok,
+                   connect_error, loss_pct, avg_rtt_ms, internet_ok
+            FROM visits
+            WHERE epoch>=? AND (connect_ok=0
+                                OR (loss_pct IS NOT NULL AND loss_pct>0)
+                                OR internet_ok=0)
+            ORDER BY epoch DESC LIMIT ?
+            """, (since_epoch, limit))
 
     def suspects(self, since_epoch):
         """BSSIDs that look like they are dropping data or have no backhaul.

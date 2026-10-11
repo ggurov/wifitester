@@ -1,0 +1,18 @@
+[Unit]
+Description=wifitester web UI (live wifi status)
+Documentation=file:///opt/wifitester/README.md
+After=NetworkManager.service wifitester.service
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+Environment=PYTHONPATH=/opt/wifitester
+ExecStart=/usr/bin/python3 -m wifitester serve --config /etc/wifitester/config.toml --data /var/lib/wifitester
+Restart=on-failure
+RestartSec=10
+ProtectSystem=full
+# psk_file reads only; datastore needs WAL shm access, so no ReadOnlyPaths here
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target
