@@ -34,61 +34,91 @@ class Runner:
                 "no wired uplink detected -- cycling the only wifi link would "
                 "cut your access to this Pi; set require_wired_uplink=false in "
                 "config to override")
+        if self.cfg.static_ipv4:
+            ip = self.cfg.static_ipv4.split("/")[0]
+            if not nm.addr_assigned(ip):
+                arp_iface = nm.wired_iface() or self.cfg.interface
+                if nm.ip_in_use(ip, arp_iface):
+                    raise PreflightError(
+                        f"static_ipv4 {ip} is answered by another device on "
+                        f"the LAN (arping via {arp_iface}) -- pick a free "
+                        "address outside the DHCP pool")
 
     # -- cycle ------------------------------------------------------------
 
-    def cycle(self):
+    def _visit_items(self):
+        """Expand configured APs into per-BSSID visit items so every mesh
+        node gets probed, not just the one NM roams to."""
+        items = []
         for ap in self.cfg.aps:
-            if self.stop.is_set():
-                return
             if not ap.enabled:
                 continue
+            if ap.expected_bssids:
+                items.extend((ap, b) for b in ap.expected_bssids)
+            else:
+                items.append((ap, None))
+        return items
+
+    def cycle(self):
+        for ap, bssid in self._visit_items():
+            if self.stop.is_set():
+                return
             try:
-                rec = self.visit_ap(ap)
+                rec = self.visit_ap(ap, bssid)
             except nm.CommandError as exc:
-                rec = {"ssid": ap.ssid, "connect_ok": False,
+                rec = {"ssid": ap.ssid, "bssid": bssid, "connect_ok": False,
                        "connect_error": str(exc)[:300]}
                 log.error("visit %s failed: %s", ap.ssid, exc)
             self.store.insert_visit(rec)
+            label = f"{ap.ssid}@{bssid}" if bssid else ap.ssid
             if not rec.get("connect_ok"):
                 log.warning("%s: connect failed (%s)",
-                            ap.ssid, rec.get("connect_error", "?"))
+                            label, rec.get("connect_error", "?"))
             else:
                 log.info("%s: bssid=%s sig=%sdBm loss=%s%% avg=%sms gw=%s",
-                         ap.ssid, rec.get("bssid"), rec.get("signal_dbm"),
+                         label, rec.get("bssid"), rec.get("signal_dbm"),
                          rec.get("loss_pct"), rec.get("avg_rtt_ms"),
                          rec.get("gateway"))
 
-    def visit_ap(self, ap):
-        """Connect to one AP, probe the gateway, return a visit record."""
+    def visit_ap(self, ap, bssid=None):
+        """Associate (optionally pinned to one BSSID), probe the gateway,
+        return a visit record."""
         try:
             psk = None if ap.open else _read_psk(ap)
         except OSError as exc:
-            return {"ssid": ap.ssid, "connect_ok": False,
+            return {"ssid": ap.ssid, "bssid": bssid, "connect_ok": False,
                     "connect_error": f"psk unreadable: {exc}"}
         key_mgmt = "none" if ap.open else "wpa-psk"
-        name = nm.ensure_profile(self.cfg.interface, ap.ssid, psk, key_mgmt)
+        name = nm.ensure_profile(self.cfg.interface, ap.ssid, psk, key_mgmt,
+                                 self.cfg.static_ipv4, self.cfg.static_gateway)
 
-        rec = {"ssid": ap.ssid, "connect_ok": False}
+        rec = {"ssid": ap.ssid, "bssid": bssid, "connect_ok": False}
         try:
+            if bssid:
+                nm.set_profile_bssid(name, bssid)
             t0 = time.monotonic()
-            nm.up_profile(name, timeout_s=self.cfg.connect_timeout_s)
-            link = nm.iw_link(self.cfg.interface)
-            rec.update({
-                "connect_ok": True,
-                "bssid": link.get("bssid"),
-                "signal_dbm": link.get("signal_dbm"),
-                "freq_mhz": link.get("freq_mhz"),
-                "chan": link.get("chan"),
-            })
-            log.debug("%s: associated in %.1fs", ap.ssid,
-                      time.monotonic() - t0)
+            try:
+                nm.up_profile(name, timeout_s=self.cfg.connect_timeout_s)
+                link = nm.iw_link(self.cfg.interface)
+                rec.update({
+                    "connect_ok": True,
+                    "bssid": link.get("bssid") or bssid,
+                    "signal_dbm": link.get("signal_dbm"),
+                    "freq_mhz": link.get("freq_mhz"),
+                    "chan": link.get("chan"),
+                })
+                log.debug("%s: associated in %.1fs", ap.ssid,
+                          time.monotonic() - t0)
+            finally:
+                if bssid:
+                    nm.set_profile_bssid(name, "")  # clear pin
         except nm.CommandError as exc:
             rec["connect_error"] = exc.stderr[:300] or str(exc)[:300]
             return rec
 
-        time.sleep(self.cfg.settle_s)  # let DHCP/default route land
-        gw = nm.default_gateway(self.cfg.interface)
+        time.sleep(self.cfg.settle_s)  # static: address is already on
+        gw = nm.default_gateway(self.cfg.interface) or \
+            (self.cfg.static_gateway if self.cfg.static_ipv4 else None)
         rec["gateway"] = gw
         link = nm.iw_link(self.cfg.interface)  # refresh after settle
         rec.update({k: link[k] for k in ("bssid", "signal_dbm", "freq_mhz", "chan")
@@ -163,7 +193,8 @@ class Runner:
         """Associate to one specific BSSID with our PSK; classify outcome."""
         ssid, bssid = net["ssid"], net["bssid"]
         name = nm.ensure_profile(self.cfg.interface, ssid, psk,
-                                 nm.key_mgmt_for(net.get("security")))
+                                 nm.key_mgmt_for(net.get("security")),
+                                 self.cfg.static_ipv4, self.cfg.static_gateway)
         t0 = time.monotonic()
         try:
             nm.set_profile_bssid(name, bssid)
@@ -186,7 +217,8 @@ class Runner:
     def _assoc_attempt(self, net):
         """Try associating to an unknown OPEN network."""
         ssid, bssid = net["ssid"], net["bssid"]
-        name = nm.ensure_profile(self.cfg.interface, ssid, None, "none")
+        name = nm.ensure_profile(self.cfg.interface, ssid, None, "none",
+                                 self.cfg.static_ipv4, self.cfg.static_gateway)
         t0 = time.monotonic()
         try:
             nm.set_profile_bssid(name, bssid)

@@ -30,6 +30,9 @@ class Config:
     connect_timeout_s: float = 15
     restore_connection: bool = True
     require_wired_uplink: bool = True
+    # All APs bridge to the same LAN: static addressing skips DHCP entirely.
+    static_ipv4: str = ""          # e.g. "192.168.1.248/24"; "" = DHCP
+    static_gateway: str = ""       # optional default route for the test iface
 
     probe_count: int = 3
     probe_interval_s: float = 0.4
@@ -88,6 +91,16 @@ def load(path) -> tuple[Config, list[str]]:
     cfg.connect_timeout_s = float(_get(t, "connect_timeout_s", float, errors, cfg.connect_timeout_s))
     cfg.restore_connection = bool(_get(t, "restore_connection", bool, errors, cfg.restore_connection))
     cfg.require_wired_uplink = bool(_get(t, "require_wired_uplink", bool, errors, cfg.require_wired_uplink))
+    cfg.static_ipv4 = str(_get(t, "static_ipv4", str, errors, cfg.static_ipv4))
+    cfg.static_gateway = str(_get(t, "static_gateway", str, errors, cfg.static_gateway))
+    if cfg.static_ipv4 and not re.match(r"^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$",
+                                        cfg.static_ipv4):
+        errors.append(f"tester.static_ipv4 must be ip/prefix, "
+                      f"got {cfg.static_ipv4!r}")
+    if cfg.static_gateway and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$",
+                                           cfg.static_gateway):
+        errors.append(f"tester.static_gateway must be an IPv4 address, "
+                      f"got {cfg.static_gateway!r}")
 
     p = raw.get("probe", {})
     cfg.probe_count = int(_get(p, "count", int, errors, cfg.probe_count))

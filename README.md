@@ -51,9 +51,17 @@ signal-strength-over-time, loss-per-visit, and neighbor-signal charts.
 
 ## Layout / safety
 
+- **Per-BSSID probing**: configured APs expand into their `expected_bssids`
+  and each mesh node gets its own pinned association + probe — the status
+  page is one card per BSSID (sorted by BSSID), so a flaky node can't hide
+  behind its SSID. Unpinned APs (or BSSIDs discovered later) are classified
+  by the scan pass instead.
+- **Static addressing**: with `static_ipv4` set (all APs bridge the same
+  LAN), the tester profiles use manual IPv4/IPv6-off — no DHCP per visit,
+  settle drops to ~0.5 s. The address is arping-checked at startup.
 - One radio = sequential visits. Cadence is intentionally aggressive
   (default: back-to-back sweeps, `cycle_interval_s = 5` — association time
-  alone paces it at ~10-20 s per AP) to catch transient outages. Each visit
+  alone paces it at ~5 s per node) to catch transient outages. Each visit
   fires 3 fast pings (1 s deadline) so sub-second blips surface as loss.
 - Offline configured APs cost `connect_timeout_s` (15 s) per sweep; pin
   verified BSSIDs (`expected_bssids`) to keep scan passes ~15 s instead of

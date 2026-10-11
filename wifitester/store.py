@@ -195,6 +195,17 @@ class Store:
             ORDER BY v.ssid
             """, (since_epoch,))
 
+    def latest_visit_per_bssid(self, since_epoch):
+        """Most recent visit row for each BSSID: one card per physical AP."""
+        return self._rows(
+            """
+            SELECT v.* FROM visits v
+            JOIN (SELECT bssid, MAX(epoch) AS m FROM visits
+                  WHERE epoch>=? AND bssid IS NOT NULL GROUP BY bssid) t
+              ON v.bssid=t.bssid AND v.epoch=t.m
+            ORDER BY v.bssid
+            """, (since_epoch,))
+
     def event_feed(self, since_epoch, limit=30):
         """Recent anomalies: connect failures, loss, internet misses."""
         return self._rows(

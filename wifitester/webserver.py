@@ -30,15 +30,15 @@ def api_state(store, cfg, started):
     except Exception as exc:  # radio busy mid-switch: show last known
         log.debug("live state unavailable: %s", exc)
 
-    aps = []
-    for r in store.latest_visit_per_ssid(now - 86400):
-        aps.append({
-            "ssid": r["ssid"], "ts": r["ts"], "age_s": round(now - r["epoch"]),
+    nodes = []
+    for r in store.latest_visit_per_bssid(now - 86400):
+        nodes.append({
+            "ssid": r["ssid"], "bssid": r["bssid"], "ts": r["ts"],
+            "age_s": round(now - r["epoch"]),
             "connect_ok": bool(r["connect_ok"]),
             "connect_error": r["connect_error"],
-            "bssid": r["bssid"], "chan": r["chan"],
-            "signal_dbm": r["signal_dbm"], "loss_pct": r["loss_pct"],
-            "avg_rtt_ms": r["avg_rtt_ms"],
+            "chan": r["chan"], "signal_dbm": r["signal_dbm"],
+            "loss_pct": r["loss_pct"], "avg_rtt_ms": r["avg_rtt_ms"],
             "internet_ok": None if r["internet_ok"] is None
             else bool(r["internet_ok"]),
         })
@@ -66,7 +66,7 @@ def api_state(store, cfg, started):
         "now": now,
         "uptime_s": round(now - started),
         "live": live,
-        "aps": aps,
+        "nodes": nodes,
         "events": events,
         "suspects": _rowdicts(store.suspects(now - 86400)),
         "last_scan_age_s": (round(now - last_scan) if last_scan else None),
@@ -76,6 +76,9 @@ def api_state(store, cfg, started):
             "probe_interval_s": cfg.probe_interval_s,
             "connect_timeout_s": cfg.connect_timeout_s,
             "scan_interval_s": cfg.scan_interval_s,
+            "static_ipv4": cfg.static_ipv4,
+            "visit_items": len([1 for ap in cfg.aps if ap.enabled
+                                for _ in (ap.expected_bssids or [None])]),
         },
     }
 
@@ -141,7 +144,7 @@ svg text{fill:var(--mut);font-size:11px}
  <div class="card"><div class="k">channel</div><div class="v" id="l-chan">&mdash;</div></div>
 </div>
 
-<h2>Access points</h2>
+<h2>Mesh nodes (per BSSID)</h2>
 <div class="grid" id="aps"></div>
 
 <h2>Signal, last 2h (dBm)</h2>
@@ -163,19 +166,19 @@ function ago(s){if(s<90)return s+'s';if(s<5400)return Math.round(s/60)+'m';
 if(s<172800)return Math.round(s/3600)+'h';return Math.round(s/86400)+'d'}
 function fmt(s){return s?esc(s.replace('T',' ').replace('Z','')):'-'}
 
-function apCard(a){
- let cls='b-bad',label='DOWN',txt=esc((a.connect_error||'connect failed').slice(0,60));
- if(a.connect_ok){
-  if(a.loss_pct>=100){label='NO BACKHAUL';cls='b-bad';txt='auth ok, 0/0 probes pass'}
-  else if(a.loss_pct>0){label='LOSS '+a.loss_pct+'%';cls='b-warn';txt='rtt '+a.avg_rtt_ms+'ms'}
-  else{label='OK';cls='b-ok';txt=(a.signal_dbm??'?')+' dBm &middot; rtt '+a.avg_rtt_ms+'ms'+
-   (a.internet_ok===false?' &middot; <span class=bad>WAN down</span>':'')}
+function nodeCard(n){
+ let cls='b-bad',label='DOWN',txt=esc((n.connect_error||'connect failed').slice(0,70));
+ if(n.connect_ok){
+  if(n.loss_pct>=100){label='NO BACKHAUL';cls='b-bad';txt='assoc ok, zero probes pass'}
+  else if(n.loss_pct>0){label='LOSS '+n.loss_pct+'%';cls='b-warn';txt='rtt '+n.avg_rtt_ms+'ms'}
+  else{label='OK';cls='b-ok';txt=(n.signal_dbm??'?')+' dBm &middot; rtt '+n.avg_rtt_ms+'ms'+
+   (n.internet_ok===false?' &middot; <span class=bad>WAN down</span>':'')}
  }
- return `<div class="card"><div class="k">${esc(a.ssid)}</div>
- <div class="v"><span class="badge ${cls}">${label}</span></div>
- <div class="v mono">${esc(a.bssid||'-')} ch${a.chan??'-'}</div>
+ return `<div class="card"><div class="k"><span class="badge ${cls}">${label}</span></div>
+ <div class="v mono">${esc(n.bssid||'-')}</div>
+ <div class="sub">${esc(n.ssid)} &middot; ch${n.chan??'-'}</div>
  <div class="sub">${txt}</div>
- <div class="sub">visited ${ago(a.age_s)} ago</div></div>`;
+ <div class="sub">probed ${ago(n.age_s)} ago</div></div>`;
 }
 
 function chart(el, series, yInv, yLabel){
@@ -213,7 +216,9 @@ async function pollState(){
   const s=await(await fetch('/api/state')).json();
   $('dot').className='ok';
   const l=s.live;
-  $('hdr').textContent=`live view of ${l.iface} &middot; cycle ${s.cycle.cycle_interval_s}s `+
+  $('hdr').textContent=`live view of ${l.iface}`+
+   (s.cycle.static_ipv4?` &middot; static ${s.cycle.static_ipv4}`:'')+
+   ` &middot; ${s.cycle.visit_items} node probes/sweep &middot; cycle ${s.cycle.cycle_interval_s}s `+
    `(${s.cycle.probe_count} probes / ${s.cycle.probe_interval_s}s) &middot; scan ${s.cycle.scan_interval_s}s`+
    (s.last_scan_age_s!=null?` &middot; last scan ${ago(s.last_scan_age_s)} ago`:'')+
    ` &middot; up ${ago(s.uptime_s)}`;
@@ -223,7 +228,8 @@ async function pollState(){
   $('l-sig').innerHTML=l.signal_dbm!=null?
    `<span class="${sigClass(l.signal_dbm)}">${l.signal_dbm} dBm</span>`:'-';
   $('l-chan').textContent=l.chan?`ch${l.chan} (${l.freq_mhz} MHz)`:'-';
-  $('aps').innerHTML=s.aps.map(apCard).join('')||'<div class="sub">no visits yet</div>';
+  const nodes=[...s.nodes].sort((a,b)=>(a.bssid||'').localeCompare(b.bssid||''));
+  $('aps').innerHTML=nodes.map(nodeCard).join('')||'<div class="sub">no probes yet</div>';
   $('events').innerHTML=s.events.length?s.events.map(e=>{
    const cls=e.kind==='loss'?'warn':'bad';
    return `<div class="event"><span class="badge b-${cls}">${e.kind.toUpperCase()}</span>
@@ -243,11 +249,11 @@ async function pollSeries(){
  try{
   const s=await(await fetch('/api/series?hours=2')).json();
   const by={};
-  s.signal.forEach(r=>{const k=`${r.ssid} ${r.bssid?r.bssid.slice(0,8):''}`;
+  s.signal.forEach(r=>{const k=`${r.bssid} ${r.ssid}`;
    (by[k]=by[k]||[]).push([r.epoch,r.dbm])});
   chart($('c-sig'),Object.entries(by).map(([label,pts])=>({label,pts})),true,'dBm');
   const byL={};
-  s.loss.forEach(r=>{const k=`${r.ssid} ${r.bssid?r.bssid.slice(0,8):''}`;
+  s.loss.forEach(r=>{const k=`${r.bssid} ${r.ssid}`;
    (byL[k]=byL[k]||[]).push([r.epoch,r.pct])});
   chart($('c-loss'),Object.entries(byL).map(([label,pts])=>({label,pts})),false,'%');
  }catch(e){}

@@ -91,6 +91,37 @@ def wired_uplink_present():
     return False
 
 
+def wired_iface():
+    """First connected non-wireless device name, or None."""
+    for d in list_devices():
+        if d["type"] in ("loopback", "wifi", "wifi-p2p"):
+            continue
+        if d["state"].startswith("connected"):
+            return d["device"]
+    return None
+
+
+def addr_assigned(ip):
+    """True if ip is configured on any local interface."""
+    out = run(["ip", "-j", "-4", "addr"], timeout=10, check=False).stdout
+    try:
+        for ifc in json.loads(out):
+            for a in ifc.get("addr_info", []):
+                if a.get("local") == ip:
+                    return True
+    except json.JSONDecodeError:
+        pass
+    return False
+
+
+def ip_in_use(ip, iface, timeout_s=3):
+    """True if something on the L2 segment answers ARP for ip (conflict check)."""
+    proc = run(["arping", "-c", "2", "-w", str(max(1, int(timeout_s))),
+                "-I", iface, ip],
+               timeout=timeout_s + 5, check=False)
+    return proc.returncode == 0
+
+
 def device_connected(iface):
     out = run(["nmcli", "-t", "-f", "GENERAL.STATE", "dev", "show", iface],
               timeout=15).stdout
@@ -152,15 +183,26 @@ def profile_name(ssid):
     return f"{PROFILE_PREFIX}{safe}"
 
 
-def ensure_profile(iface, ssid, psk, key_mgmt):
+def ensure_profile(iface, ssid, psk, key_mgmt, static_ipv4="", static_gateway=""):
     """Create or refresh profile <prefix><safe(ssid)>; autoconnect off.
-    Returns profile name."""
+    static_ipv4 "a.b.c.d/prefix" switches the profile to manual IPv4 (no
+    DHCP); IPv6 is ignored either way. Returns profile name."""
     name = profile_name(ssid)
     if name not in list_profiles():
         run(["nmcli", "con", "add", "type", "wifi", "con-name", name,
              "ifname", iface, "ssid", ssid, "autoconnect", "no"], timeout=30)
     mods = ["nmcli", "con", "mod", name,
-            "802-11-wireless.bssid", ""]  # clear any leftover pin
+            "802-11-wireless.bssid", "",  # clear any leftover pin
+            "ipv6.method", "ignore"]
+    if static_ipv4:
+        mods += ["ipv4.method", "manual",
+                 "ipv4.addresses", static_ipv4,
+                 "ipv4.gateway", static_gateway,
+                 "ipv4.dns", ""]
+    else:
+        mods += ["ipv4.method", "auto",
+                 "ipv4.addresses", "",
+                 "ipv4.gateway", ""]
     if key_mgmt != "none":
         mods += ["802-11-wireless-security.key-mgmt", key_mgmt]
         if psk is not None:

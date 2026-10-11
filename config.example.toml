@@ -5,12 +5,18 @@
 [tester]
 interface = "wlan0"            # test radio
 # Fast cadence to catch transient outages: sweeps run back-to-back, paced by
-# association time (~10-20s per AP visit on one radio).
+# association time (~5s per node visit on one radio).
 cycle_interval_s = 5           # min gap after a completed sweep
-settle_s = 1.5                 # wait after association for DHCP/route
+settle_s = 0.5                 # wait after association (static: address is
+                               # already on; 0.5s lets ARP settle)
 connect_timeout_s = 15         # nmcli con up timeout (offline APs cost this)
 restore_connection = true      # put the radio back on its original network
 require_wired_uplink = true    # refuse to run without a non-wifi uplink
+# All APs bridge the same LAN: static addressing skips DHCP entirely (settle
+# drops to ~0.5s and visits get deterministic). Must be a free address
+# outside the DHCP pool; the tester arping-checks it at startup.
+static_ipv4 = "192.168.1.248/24"
+static_gateway = "192.168.1.1"
 
 [probe]
 count = 3                      # gateway pings per visit
@@ -33,13 +39,16 @@ host = "0.0.0.0"               # status page: http://<pi-ip>:8787
 port = 8787
 
 # --- known access points ------------------------------------------------
-# expected_bssids: BSSIDs you have verified are yours. They are trusted and
-# skip auth probing. Leave empty to auth-probe every BSSID on each scan.
+# expected_bssids: verified mesh nodes. The probe cycle visits EACH listed
+# BSSID individually (pinned associations), so every node's backhaul gets
+# tested -- not just whichever one the radio roams to. The status page shows
+# one card per BSSID. Leave empty to probe the SSID unpinned (any node) and
+# let scans classify individual BSSIDs instead.
 
 [[ap]]
 ssid = "Cisco144454"
 psk_file = "/etc/wifitester/psk/cisco144454"
-expected_bssids = []           # e.g. ["D4:5D:64:10:43:F8"]
+expected_bssids = ["D4:5D:64:10:43:F8"]
 
 [[ap]]
 ssid = "77fast5"

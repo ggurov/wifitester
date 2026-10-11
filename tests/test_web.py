@@ -36,11 +36,11 @@ class TestApiPayloads(unittest.TestCase):
 
     def test_state_shape(self):
         s = webserver.api_state(self.st, self.cfg, started=time.time() - 5)
-        for key in ("now", "uptime_s", "live", "aps", "events", "suspects",
+        for key in ("now", "uptime_s", "live", "nodes", "events", "suspects",
                     "cycle", "last_scan_age_s"):
             self.assertIn(key, s)
-        by_ssid = {a["ssid"]: a for a in s["aps"]}
-        self.assertEqual(by_ssid["ghost"]["loss_pct"], 100.0)
+        by_bssid = {n["bssid"]: n for n in s["nodes"]}
+        self.assertEqual(by_bssid["BB:00"]["loss_pct"], 100.0)
         kinds = {e["kind"] for e in s["events"]}
         self.assertIn("no_backhaul", kinds)
         self.assertEqual(s["last_scan_age_s"], 0)
@@ -74,7 +74,7 @@ class TestServeHttp(unittest.TestCase):
         t.start()
         try:
             for path, expect in [("/", "wifitester live"),
-                                 ("/api/state", '"aps"'),
+                                 ("/api/state", '"nodes"'),
                                  ("/api/series?hours=1", '"signal"')]:
                 with urllib.request.urlopen(
                         f"http://127.0.0.1:{port}{path}", timeout=5) as r:
