@@ -1,0 +1,15 @@
+# OS / editor junk
+.DS_Store
+Thumbs.db
+
+# Node
+node_modules/
+
+# wifitester runtime state: local datastore, graphs, live config, secrets
+data/
+__pycache__/
+*.py[cod]
+config.toml
+dashboard.html
+
+# Wolf runtime state is ignored inside .wolf/.gitignore; nothing else to hide here.

@@ -1,0 +1,17 @@
+[Unit]
+Description=wifitester - round-robin AP connectivity prober
+Documentation=file:///opt/wifitester/README.md
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+Environment=PYTHONPATH=/opt/wifitester
+ExecStart=/usr/bin/python3 -m wifitester run --config /etc/wifitester/config.toml --data /var/lib/wifitester
+Restart=on-failure
+RestartSec=30
+ProtectSystem=full
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Convenience launcher: wifitester <subcommand> ...
+export PYTHONPATH="$(cd "$(dirname "$0")" && pwd)${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m wifitester "$@"

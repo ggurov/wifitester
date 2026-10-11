@@ -1,0 +1,50 @@
+# wifitester configuration
+# Copy to /etc/wifitester/config.toml and fill in psk values.
+# Keep real credentials OUT of this repo: use psk_file or chmod 600 the file.
+
+[tester]
+interface = "wlan0"            # test radio
+cycle_interval_s = 300         # full sweep of all APs every 5 min
+settle_s = 3.0                 # wait after association for DHCP/route
+connect_timeout_s = 45         # nmcli con up timeout
+restore_connection = true      # put the radio back on its original network
+require_wired_uplink = true    # refuse to run without a non-wifi uplink
+
+[probe]
+count = 5                      # gateway pings per visit
+interval_s = 2.0
+timeout_s = 2.0                # per-ping deadline
+internet_target = "1.1.1.1"    # "" disables the WAN-hop check
+
+[scan]
+interval_s = 900               # scan+classify pass cadence (from `run`)
+rescan = true                  # force an active scan, not cached results
+                               # never | mismatch_only | all
+auth_probe = "mismatch_only"
+open_assoc = true              # try associating to unknown OPEN networks
+auth_timeout_s = 25            # per-BSSID association attempt deadline
+
+# --- known access points ------------------------------------------------
+# expected_bssids: BSSIDs you have verified are yours. They are trusted and
+# skip auth probing. Leave empty to auth-probe every BSSID on each scan.
+
+[[ap]]
+ssid = "Cisco144454"
+psk_file = "/etc/wifitester/psk/cisco144454"
+expected_bssids = []           # e.g. ["D4:5D:64:10:43:F8"]
+
+[[ap]]
+ssid = "77fast5"
+psk_file = "/etc/wifitester/psk/77fast5"
+expected_bssids = []
+
+[[ap]]
+ssid = "77fast6"
+psk_file = "/etc/wifitester/psk/77fast6"
+expected_bssids = []
+
+# More APs: add another [[ap]] block.
+# [[ap]]
+# ssid = "one-more"
+# psk = "plaintext-here"       # psk works too; psk_file is safer
+# expected_bssids = []
