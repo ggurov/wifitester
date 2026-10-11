@@ -124,6 +124,8 @@ table{border-collapse:collapse;width:100%;font-size:13px}
 th,td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--line)}
 th{color:var(--mut);font-weight:500}
 .badge{padding:1px 8px;border-radius:10px;font-size:12px;font-weight:600}
+.ssidtag{float:right;color:var(--mut);font-size:12px}
+.ssidtag b{color:var(--fg);font-weight:600}
 .b-ok{background:#14321f;color:var(--ok)}
 .b-warn{background:#33260e;color:var(--warn)}
 .b-bad{background:#3a1414;color:var(--bad)}
@@ -174,9 +176,10 @@ function nodeCard(n){
   else{label='OK';cls='b-ok';txt=(n.signal_dbm??'?')+' dBm &middot; rtt '+n.avg_rtt_ms+'ms'+
    (n.internet_ok===false?' &middot; <span class=bad>WAN down</span>':'')}
  }
- return `<div class="card"><div class="k"><span class="badge ${cls}">${label}</span></div>
+ return `<div class="card"><div class="k"><span class="badge ${cls}">${label}</span>
+ <span class="ssidtag">ssid: <b>${esc(n.ssid||'-')}</b></span></div>
  <div class="v mono">${esc(n.bssid||'-')}</div>
- <div class="sub">${esc(n.ssid)} &middot; ch${n.chan??'-'}</div>
+ <div class="sub">ch${n.chan??'-'} &middot; ${(n.signal_dbm??'?')} dBm &middot; rtt ${n.avg_rtt_ms??'-'}ms</div>
  <div class="sub">${txt}</div>
  <div class="sub">probed ${ago(n.age_s)} ago</div></div>`;
 }
