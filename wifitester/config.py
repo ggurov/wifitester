@@ -24,7 +24,14 @@ class APConfig:
 
 @dataclass
 class Config:
-    interface: str = "wlan0"
+    interface: str = "wlan0"       # primary radio: scans + legacy profile names
+    interfaces: list[str] = field(default_factory=lambda: ["wlan0"])
+    # auto_radios: interfaces = "auto" -> hot-plug discovery of wifi radios
+    # (join on plug-in, leave on removal); extras grab a DHCP lease once and
+    # reuse the cached address until the lease expires.
+    auto_radios: bool = False
+    # extra radios probe nodes in parallel; 2.4 GHz-only sticks must not be
+    # listed as the primary (scans need band coverage)
     cycle_interval_s: float = 5
     settle_s: float = 1.5
     connect_timeout_s: float = 15
@@ -87,6 +94,22 @@ def load(path) -> tuple[Config, list[str]]:
 
     t = raw.get("tester", {})
     cfg.interface = str(_get(t, "interface", str, errors, cfg.interface))
+    raw_ifaces = raw.get("tester", {}).get("interfaces")
+    if isinstance(raw_ifaces, str) and raw_ifaces.strip().lower() == "auto":
+        cfg.auto_radios = True
+        cfg.interfaces = [cfg.interface]
+    else:
+        ifaces = _get(t, "interfaces", lambda v: [str(x) for x in v], errors,
+                      None)
+        if ifaces:
+            cfg.interfaces = ifaces
+    if cfg.interface not in cfg.interfaces:
+        cfg.interfaces.insert(0, cfg.interface)
+    seen_i = []
+    for i in cfg.interfaces:
+        if i not in seen_i:
+            seen_i.append(i)
+    cfg.interfaces = seen_i
     cfg.cycle_interval_s = float(_get(t, "cycle_interval_s", float, errors, cfg.cycle_interval_s))
     cfg.settle_s = float(_get(t, "settle_s", float, errors, cfg.settle_s))
     cfg.connect_timeout_s = float(_get(t, "connect_timeout_s", float, errors, cfg.connect_timeout_s))

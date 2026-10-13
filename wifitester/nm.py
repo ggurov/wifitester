@@ -1,6 +1,7 @@
 """Thin wrappers around nmcli / iw / ip. Every external call funnels through
 run() so tests can monkeypatch one seam."""
 
+import ipaddress
 import json
 import logging
 import re
@@ -81,6 +82,67 @@ def wifi_interface_present(iface):
                for d in list_devices())
 
 
+def wifi_interfaces():
+    """All wlan interface names currently present (sysfs enumeration)."""
+    import glob
+    return sorted(p.rsplit("/", 1)[-1]
+                  for p in glob.glob("/sys/class/net/wlan*"))
+
+
+def wifi_connection_map():
+    """{wifi device: active connection profile name} (empty/"" when
+    disconnected). One `nmcli dev status` call for all devices."""
+    out = run(["nmcli", "-t", "-f", "DEVICE,TYPE,CONNECTION", "dev",
+               "status"], timeout=15, check=False).stdout or ""
+    devs = {}
+    for line in out.splitlines():
+        f = line.split(":", 2)
+        if len(f) == 3 and f[1] == "wifi" and f[0]:
+            devs[f[0]] = f[2]
+    return devs
+
+
+def iface_mac(iface):
+    """Lowercase MAC of an interface, or None."""
+    out = run(["cat", f"/sys/class/net/{iface}/address"], timeout=10,
+              check=False).stdout
+    mac = (out or "").strip().lower()
+    return mac if re.match(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$", mac) else None
+
+
+def usb_reset_radio(iface):
+    """Power-cycle a USB wifi adapter by de-authorizing and re-authorizing
+    its USB device (forces driver + firmware re-init). The interface name
+    may change after this; callers must re-enumerate."""
+    dev = run(["readlink", "-f", f"/sys/class/net/{iface}/device"],
+              timeout=10, check=False).stdout.strip()
+    if "/usb" not in dev or not re.search(r":\d+\.\d+$", dev):
+        raise RuntimeError(f"{iface} is not a USB device ({dev or 'gone'})")
+    parent = re.sub(r":\d+\.\d+$", "", dev)
+    auth = f"{parent}/authorized"
+    run(["sh", "-c", f"echo 0 > '{auth}' && sleep 2 && echo 1 > '{auth}'"],
+        timeout=20, check=False)
+    time.sleep(4)
+
+
+def dhcp4_info(iface):
+    """Parsed DHCP4 lease info for an interface:
+    {"ip", "lease_time", "expires"} (best effort; {} when absent)."""
+    out = run(["nmcli", "-f", "DHCP4", "dev", "show", iface],
+              timeout=15, check=False).stdout or ""
+    info = {}
+    m = re.search(r"dhcp_lease_time\s*=\s*(\d+)", out)
+    if m:
+        info["lease_time"] = int(m.group(1))
+    m = re.search(r"expiry\s*=\s*(\d+)", out)
+    if m:
+        info["expires"] = int(m.group(1))
+    m = re.search(r"ip_address\s*=\s*(\d+\.\d+\.\d+\.\d+)", out)
+    if m:
+        info["ip"] = m.group(1)
+    return info
+
+
 def wired_uplink_present():
     """True if some non-wireless, non-loopback device is connected."""
     for d in list_devices():
@@ -133,6 +195,35 @@ def ip_in_use(ip, iface, timeout_s=3):
                 "-I", iface, ip],
                timeout=timeout_s + 5, check=False)
     return proc.returncode == 0
+
+
+def ensure_uplink_route():
+    """True if the wired uplink has its connected subnet route, re-installing
+    it when something removed it (a vanished /24 route blackholes LAN
+    replies). Also True when there is no wired uplink or state is unreadable
+    -- the guard must never fail its caller."""
+    iface = wired_iface()
+    if not iface:
+        return True
+    out = run(["ip", "-j", "-4", "addr", "show", "dev", iface],
+              timeout=10, check=False).stdout
+    try:
+        infos = json.loads(out or "[]")
+    except ValueError:
+        return True
+    info = next((a for d in infos for a in d.get("addr_info", [])), None)
+    if not info or not info.get("local"):
+        return True
+    net = ipaddress.ip_network(f"{info['local']}/{info['prefixlen']}",
+                               strict=False)
+    if f"{net} dev {iface}" in (run(["ip", "route"], timeout=10,
+                                    check=False).stdout or ""):
+        return True
+    run(["ip", "route", "replace", str(net), "dev", iface,
+         "proto", "kernel", "src", info["local"]], timeout=10, check=False)
+    log.warning("uplink %s was missing its %s route; re-installed",
+                iface, net)
+    return False
 
 
 def device_connected(iface):
@@ -196,22 +287,40 @@ def profile_name(ssid):
     return f"{PROFILE_PREFIX}{safe}"
 
 
-def ensure_profile(iface, ssid, psk, key_mgmt, static_ipv4="", static_gateway=""):
-    """Create or refresh profile <prefix><safe(ssid)>; autoconnect off.
+def profile_name(ssid, iface=None, primary_iface=None):
+    """Profile for (ssid, iface). The primary interface keeps the legacy
+    wt-<ssid> name; extra radios get wt-<ssid>-<iface>."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "-", ssid)
+    if iface and primary_iface and iface != primary_iface:
+        return f"{PROFILE_PREFIX}{safe}-{iface}"
+    return f"{PROFILE_PREFIX}{safe}"
+
+
+def ensure_profile(iface, ssid, psk, key_mgmt, static_ipv4="",
+                   static_gateway="", primary_iface=None, route_metric=None,
+                   band=None, never_default=False):
+    """Create or refresh this iface's profile for ssid; autoconnect off.
     static_ipv4 "a.b.c.d/prefix" switches the profile to manual IPv4 (no
-    DHCP); IPv6 is ignored either way. Returns profile name."""
-    name = profile_name(ssid)
+    DHCP); IPv6 is ignored either way. band "a"/"bg" pins the band so the
+    pre-associate scan sweeps half the channels. never_default=yes keeps a
+    default route OFF the interface (test radios must not carry traffic).
+    Returns profile name."""
+    name = profile_name(ssid, iface, primary_iface)
     if name not in list_profiles():
         run(["nmcli", "con", "add", "type", "wifi", "con-name", name,
              "ifname", iface, "ssid", ssid, "autoconnect", "no"], timeout=30)
     mods = ["nmcli", "con", "mod", name,
             "802-11-wireless.bssid", "",  # clear any leftover pin
-            "ipv6.method", "ignore"]
+            "802-11-wireless.band", band or "",  # "" = both bands
+            "ipv6.method", "ignore",
+            "ipv4.never-default", "yes" if never_default else "no"]
     if static_ipv4:
         mods += ["ipv4.method", "manual",
                  "ipv4.addresses", static_ipv4,
                  "ipv4.gateway", static_gateway,
                  "ipv4.dns", ""]
+        if route_metric is not None:
+            mods += ["ipv4.route-metric", str(route_metric)]
     else:
         mods += ["ipv4.method", "auto",
                  "ipv4.addresses", "",
@@ -281,6 +390,51 @@ def freq_to_chan(freq_mhz):
     if 5000 < freq_mhz < 6000:
         return (freq_mhz - 5000) // 5
     return None
+
+
+def chan_to_freq(chan):
+    if not chan:
+        return None
+    if chan == 14:
+        return 2484
+    if chan < 14:
+        return 2407 + 5 * chan
+    if chan < 15:
+        return None
+    if chan < 190:
+        return 5000 + 5 * chan
+    return 5950 + 5 * chan
+
+
+def iface_bands():
+    """{iface: set(freq_mhz)} of enabled channels per wifi interface.
+    Multiple interfaces can share a phy; each maps to its phy's set."""
+    out = run(["iw", "dev"], timeout=15).stdout
+    iface_phy = {}
+    phy = None
+    for line in out.splitlines():
+        s = line.strip()
+        if s.startswith("phy#"):
+            phy = s[4:]
+        elif s.startswith("Interface "):
+            iface_phy[s[10:].strip()] = phy
+    out = run(["iw", "list"], timeout=30).stdout
+    phy_freqs = {}
+    cur = None
+    for line in out.splitlines():
+        s = line.strip()
+        if s.startswith("Wiphy phy"):
+            cur = s[9:]
+        elif cur and s.startswith("* ") and "MHz" in s:
+            if "(disabled" in s:
+                continue
+            m = re.match(r"\*\s*(\d+(?:\.\d+)?)\s*MHz", s)
+            if m:
+                phy_freqs.setdefault(cur, set()).add(int(float(m.group(1))))
+    res = {}
+    for iface, phy in iface_phy.items():
+        res[iface] = phy_freqs.get(phy, set())
+    return res
 
 
 def default_gateway(iface):
