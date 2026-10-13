@@ -35,6 +35,59 @@ class TestParseTsv(unittest.TestCase):
         self.assertEqual(rows[1]["SSID"], "")  # hidden
 
 
+class TestUplinkRoute(unittest.TestCase):
+    """The guard must re-install the wired uplink's connected /24 when it
+    vanishes (the link-loss failure mode) and never throw."""
+
+    def _patch(self, wired, addrs, routes):
+        import unittest.mock as mock
+        calls = []
+
+        def fake_run(cmd, **k):
+            calls.append(cmd)
+            if cmd[:3] == ["ip", "-j", "-4"]:
+                out = addrs
+            elif cmd[:2] == ["ip", "route"] and len(cmd) == 2:
+                out = routes
+            else:
+                out = ""
+            return type("R", (), {"stdout": out})()
+
+        return (mock.patch.object(nm, "wired_iface", return_value=wired),
+                mock.patch.object(nm, "run", side_effect=fake_run), calls)
+
+    def test_route_present_is_noop(self):
+        p1, p2, calls = self._patch(
+            "eth0",
+            '[{"ifname":"eth0","addr_info":[{"local":"192.168.1.252",'
+            '"prefixlen":24}]}]',
+            "default via 192.168.1.1 dev eth0 metric 100\n"
+            "192.168.1.0/24 dev eth0 proto kernel src 192.168.1.252\n")
+        with p1, p2:
+            self.assertTrue(nm.ensure_uplink_route())
+        self.assertEqual([c for c in calls if "replace" in c], [])
+
+    def test_missing_route_is_reinstalled(self):
+        p1, p2, calls = self._patch(
+            "eth0",
+            '[{"ifname":"eth0","addr_info":[{"local":"192.168.1.252",'
+            '"prefixlen":24}]}]',
+            "default via 192.168.1.1 dev eth0 metric 100\n")
+        with p1, p2:
+            self.assertFalse(nm.ensure_uplink_route())
+        replace = [c for c in calls if "replace" in c]
+        self.assertEqual(
+            replace,
+            [["ip", "route", "replace", "192.168.1.0/24", "dev", "eth0",
+              "proto", "kernel", "src", "192.168.1.252"]])
+
+    def test_no_wired_uplink_is_noop(self):
+        p1, p2, calls = self._patch(None, "[]", "")
+        with p1, p2:
+            self.assertTrue(nm.ensure_uplink_route())
+        self.assertEqual(calls, [])
+
+
 class TestFreqChan(unittest.TestCase):
     def test_2g(self):
         self.assertEqual(nm.freq_to_chan(2412), 1)

@@ -7,7 +7,7 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import ethmatch, nm
+from . import ethmatch, routers, nm
 
 log = logging.getLogger("wifitester.web")
 
@@ -30,13 +30,75 @@ def api_state(store, cfg, started):
     except Exception as exc:  # radio busy mid-switch: show last known
         log.debug("live state unavailable: %s", exc)
 
-    nodes = []
     hour = store.hour_loss(now - 3600)
+    fail_attr = store.hour_fail_attributed(now - 3600)
     neigh = store.neighbors()
+    ip_to_mac = {ip: mac for mac, ip in neigh.items()}
+    inv_rows = _rowdicts(store.ap_inventory())
+    switch_by_mac = {r["mac"]: dict(r)
+                     for r in _rowdicts(store.switch_ports())}
+    port_traffic = {r["port"]: dict(r)
+                    for r in _rowdicts(store.port_traffic())}
+    def switch_of(mac):
+        if not mac:
+            return None
+        e = switch_by_mac.get(mac.lower())
+        if not e:
+            return None
+        base = e["port"].split(".")[0]
+        t = port_traffic.get(base) or {}
+        return {"port": e["port"], "lldp_system": e.get("lldp_system"),
+                "lldp_port": e.get("lldp_port"),
+                "in_bps": t.get("in_bps"), "out_bps": t.get("out_bps")}
+
+    # -- physical AP units: polled inventory first (known wired MACs), then
+    #    OUR scanned BSSIDs grouped per resolved unit ----------------------
+    units = {}
+    for row in inv_rows:
+        wm = row["wired_mac"] or ip_to_mac.get(row["ip"])
+        if wm:
+            units[wm] = {
+                "name": row["name"], "model": row["model"], "ip": row["ip"],
+                "wired_mac": wm, "bands": {}, "clients": row["clients"],
+                "uptime": row["uptime"], "source": row["source"],
+                "radios_json": row["radios_json"]}
+    unit_by_oui = {wm[:8]: u for wm, u in units.items()}
+    # single source of truth for node cards: same inventory the Physical
+    # APs table uses, keyed by wired MAC and IP
+    unit_lookup = {}
+    for u in units.values():
+        if u.get("wired_mac"):
+            unit_lookup[u["wired_mac"].lower()] = u
+        if u.get("ip"):
+            unit_lookup.setdefault(u["ip"], u)
+
+    def resolve_unit(bssid):
+        """(wired_mac, ip, conf) for a BSSID: ethmatch first, then OUI match
+        against units with a known wired address (many-BSSID units like the
+        Aruba AP-105, whose VAP MACs are far from its bridge MAC)."""
+        emac, eip, conf = ethmatch.match_eth(bssid, neigh)
+        if emac:
+            return emac, eip, conf
+        u = unit_by_oui.get(bssid[:8])
+        if u:
+            return u["wired_mac"], u["ip"], "oui"
+        return None, None, None
+
+    nodes = []
     for r in store.latest_visit_per_bssid(now - 86400):
         h = hour.get(r["bssid"], {"sent": 0, "lost": 0, "conn_fails": 0})
         pc = cfg.probe_count
-        eth_mac, eth_ip, eth_conf = ethmatch.match_eth(r["bssid"], neigh)
+        eth_mac, eth_ip, eth_conf = resolve_unit(r["bssid"])
+        unit = unit_lookup.get(eth_mac.lower() if eth_mac else "") \
+            or (unit_lookup.get(eth_ip) if eth_ip else None)
+        model = (unit and (unit.get("name") or unit.get("model"))) \
+            or routers.model_for(eth_mac) or routers.model_for(r["bssid"])
+        # connection failures where another radio reached the same BSSID
+        # are OUR adapter's fault ("card not responding") -- they must not
+        # count as probes the AP missed
+        fa = fail_attr.get(r["bssid"], {"radio_fails": h["conn_fails"],
+                                        "solo_fails": 0})
+        ap_missed_fails = fa["solo_fails"]
         nodes.append({
             "ssid": r["ssid"], "bssid": r["bssid"], "ts": r["ts"],
             "age_s": round(now - r["epoch"]),
@@ -46,11 +108,15 @@ def api_state(store, cfg, started):
             "loss_pct": r["loss_pct"], "avg_rtt_ms": r["avg_rtt_ms"],
             "internet_ok": None if r["internet_ok"] is None
             else bool(r["internet_ok"]),
-            # 1h probe accounting (missed includes failed associations at
-            # full probe count)
-            "total1h": h["sent"] + h["conn_fails"] * pc,
-            "missed1h": h["lost"] + h["conn_fails"] * pc,
+            # 1h probe accounting (missed includes only AP-side failed
+            # associations at full probe count)
+            "total1h": h["sent"] + ap_missed_fails * pc,
+            "missed1h": h["lost"] + ap_missed_fails * pc,
+            "radio_fails1h": fa["radio_fails"],
             "eth_mac": eth_mac, "eth_ip": eth_ip, "eth_conf": eth_conf,
+            "model": routers.model_for(eth_mac)
+            or routers.model_for(r["bssid"]),
+            "switch": switch_of(eth_mac),
         })
 
     events = []
@@ -72,6 +138,81 @@ def api_state(store, cfg, started):
                        "ssid": r["ssid"], "kind": kind, "detail": detail})
 
     last_scan = store.last_scan_epoch()
+    scan_chan = {c["bssid"]: c["chan"]
+                 for c in store.latest_classification(0)
+                 if c["classification"] == "OURS"}
+    fail_streaks = store.bssid_streaks(now - 86400)
+    for n in nodes:
+        n["streak"] = fail_streaks.get(n["bssid"], 0)
+    perf_rows = _rowdicts(store.sweep_perf(1))
+    fios = {r["mac"]: dict(r) for r in _rowdicts(store.fios_leases())}
+    scan_perf = None
+    if perf_rows:
+        r = perf_rows[0]
+        # sequential baseline: the sum of the workers' own wall time (what
+        # one radio would have spent); parallel duration vs that = speedup
+        solo = r.get("visits_time_s") or r["duration_s"]
+        improvement = (max(0.0, solo - r["duration_s"]) / solo * 100
+                       if solo else 0.0)
+        scan_perf = {"radios": r["radios"], "items_total": r["items_total"],
+                     "items_done": r["items_done"],
+                     "duration_s": round(r["duration_s"], 1),
+                     "solo_estimate_s": round(solo, 1),
+                     "improvement_pct": round(improvement)}
+    for bssid, chan in scan_chan.items():
+        emac, eip, conf = resolve_unit(bssid)
+        key = emac or "bssid-" + bssid
+        u = units.setdefault(key, {
+            "name": None, "model": routers.model_for(emac)
+            or routers.model_for(bssid), "ip": eip, "wired_mac": emac,
+            "bands": {}, "clients": None, "uptime": None, "source": "scan"})
+        band = routers.band_label(None, chan) or "?"
+        u["bands"][band] = u["bands"].get(band, 0) + 1
+    for row in inv_rows:  # merge polled rows into scan-created units
+        wm = row["wired_mac"] or ip_to_mac.get(row["ip"])
+        matches = [k for k, u in units.items()
+                   if k == wm or (row["ip"] and u["ip"] == row["ip"])]
+        if not matches:
+            continue
+        u = units[matches[0]]
+        u.update(name=row["name"] or u["name"],
+                 model=row["model"] or u["model"],
+                 uptime=row["uptime"], clients=row["clients"],
+                 source=row["source"])
+        if not u["wired_mac"]:
+            u["wired_mac"] = wm
+        if wm and wm in units and units[wm] is not u:
+            units[wm].update({k: u[k] for k in ("name", "model", "clients",
+                                                "uptime", "source")})
+    for u in units.values():
+        u["switch"] = switch_of(u.get("wired_mac"))
+        lease = fios.get((u.get("wired_mac") or "").lower()) \
+            or (fios.get(u.get("ip")) if u.get("ip") else None)
+        if lease:
+            u["router_seen"] = True
+            u["hostname"] = lease.get("hostname") or None
+        try:
+            u["radios"] = json.loads(u.pop("radios_json", None) or "[]")
+        except ValueError:
+            u["radios"] = []
+    aps = {"count": len(units),
+           "units": sorted(units.values(),
+                           key=lambda u: (u["ip"] or "zz", u["name"] or ""))}
+    radios = []
+    for r in store.radio_stats():
+        row = dict(r)
+        for f in ("last_seen", "last_ok", "last_fail", "last_scan"):
+            row[f + "_age_s"] = round(now - r[f]) if r[f] else None
+        # a radio that stopped heartbeating (unplugged) must not keep its
+        # old state -- it reads GONE like any other absent adapter
+        row["present"] = bool(r["present"]) and r["last_seen"] is not None \
+            and now - r["last_seen"] < 900
+        row["fails_solo"], row["fails_shared"] = store.radio_fail_triage(
+            r["iface"], now - 21600)
+        radios.append(row)
+    for n in nodes:
+        n["band"] = routers.band_label(
+            n.get("freq_mhz"), scan_chan.get(n["bssid"]) or n.get("chan"))
     return {
         "now": now,
         "uptime_s": round(now - started),
@@ -79,6 +220,13 @@ def api_state(store, cfg, started):
         "nodes": nodes,
         "events": events,
         "suspects": _rowdicts(store.suspects(now - 86400)),
+        "aps": aps,
+        "scan_perf": scan_perf,
+        "radios": radios,
+        # radios the probe loop has heartbeated recently = actually in use
+        "radios_active": [r["iface"] for r in radios
+                          if r["last_seen_age_s"] is not None
+                          and r["last_seen_age_s"] < 300],
         "last_scan_age_s": (round(now - last_scan) if last_scan else None),
         "cycle": {
             "cycle_interval_s": cfg.cycle_interval_s,
@@ -87,6 +235,7 @@ def api_state(store, cfg, started):
             "connect_timeout_s": cfg.connect_timeout_s,
             "scan_interval_s": cfg.scan_interval_s,
             "static_ipv4": cfg.static_ipv4,
+            "interfaces": list(cfg.interfaces),
             "visit_items": len([1 for ap in cfg.aps if ap.enabled
                                 for _ in (ap.expected_bssids or [None])]),
         },
@@ -166,16 +315,20 @@ svg text{fill:var(--mut);font-size:11px}
 <h2>Mesh nodes (per BSSID)</h2>
 <div class="grid" id="aps"></div>
 
+<h2 id="apinv-h">Physical APs</h2>
+<div class="card" id="apinv"><div class="sub">none yet — poll pending</div></div>
+
 <h2>Signal, last 2h (dBm)</h2>
 <div class="card"><div id="c-sig">loading&hellip;</div></div>
-<h2>Probe loss, last 2h (%)</h2>
-<div class="card"><div id="c-loss">loading&hellip;</div></div>
-
-<h2>Events (last hour)</h2>
-<div class="card" id="events"><div class="sub">none</div></div>
 
 <h2>Suspects (24h)</h2>
 <div class="card" id="suspects"><div class="sub">none</div></div>
+
+<h2>Wifi adapters</h2>
+<div class="card" id="radios"><div class="sub">none</div></div>
+
+<h2>Events (last hour)</h2>
+<div class="card" id="events"><div class="sub">none</div></div>
 
 <script>
 const PALETTE=["#3b82f6","#ef4444","#22c55e","#a855f7","#f59e0b","#06b6d4","#ec4899","#84cc16"];
@@ -185,33 +338,58 @@ function ago(s){if(s<90)return s+'s';if(s<5400)return Math.round(s/60)+'m';
 if(s<172800)return Math.round(s/3600)+'h';return Math.round(s/86400)+'d'}
 function fmt(s){return s?esc(s.replace('T',' ').replace('Z','')):'-'}
 
-function lossBucket(n){
- const t=n.total1h||0, m=n.missed1h||0;
- if(t<=0)return'';
- const r=m/t;
- return r===0?'c-ok':r<=0.05?'c-w':r<=0.25?'c-o':'c-bad';
+function ratioColor(r){ // gradual green->yellow->orange->red by missed ratio
+ const x=Math.min(Math.max(r,0),1);
+ return `hsl(${Math.round(120-120*x)},72%,42%)`;
+}
+function sigBars(dbm){ // 4-bar wifi glyph, colored by strength
+ const lvl=dbm==null?0:dbm>=-55?4:dbm>=-67?3:dbm>=-75?2:1;
+ const col=dbm==null?'var(--mut)':(dbm>=-55?'var(--ok)':dbm>=-67?'#eab308':'var(--bad)');
+ let bars='';
+ for(let i=1;i<=4;i++){
+  const h=3+i*3;
+  bars+=`<rect x="${(i-1)*7}" y="${17-3*i}" width="5" height="${3*i}" rx="1" fill="${i<=lvl?col:'var(--line)'}"/>`;
+ }
+ return `<svg width="27" height="18" style="vertical-align:-4px">${bars}</svg>`;
+}
+function dbmPct(dbm){ // dBm -> 0-100% link quality (-100..-50 dBm span)
+ if(dbm==null)return null;
+ return Math.round(Math.min(Math.max(2*(dbm+100),0),100));
 }
 function nodeCard(n){
  let cls='b-bad',label='DOWN',txt=esc((n.connect_error||'connect failed').slice(0,70));
+ const streak=n.streak??0;
  if(n.connect_ok){
   if(n.loss_pct>=100){label='NO BACKHAUL';cls='b-bad';txt='assoc ok, zero probes pass'}
   else if(n.loss_pct>0){label='LOSS '+n.loss_pct+'%';cls='b-warn';txt='rtt '+n.avg_rtt_ms+'ms'}
-  else{label='OK';cls='b-ok';txt=(n.signal_dbm??'?')+' dBm'+
-   (n.internet_ok===false?' &middot; <span class=bad>WAN down</span>':'')}
+  else{label='OK';cls='b-ok';txt='link '+(n.internet_ok===false?'up &middot; <span class=bad>WAN down</span>':'up')}
+ }else if(streak<3){
+  label='FLAKY';cls='b-warn';txt=esc((n.connect_error||'connect failed').slice(0,60))
  }
- const cc=lossBucket(n);
- const border=cc?' '+cc:'';
  const t=n.total1h||0,m=n.missed1h||0;
+ const r=t>0?m/t:null;
+ // severity = worst of the 1h missed ratio and the live failure streak,
+ // so a node that just died trends red immediately instead of waiting
+ // for the hourly window to fill
+ const sev=Math.max(r??0, (!n.connect_ok)?Math.min(streak/5,1):0);
+ const borderStyle=sev>0?` style="border-color:${ratioColor(sev)}"`:'';
+ const pct=dbmPct(n.signal_dbm);
  const lan=n.eth_mac?`<div class="sub mono">lan ${esc(n.eth_mac)}`+
   (n.eth_ip?` @ <a href="http://${esc(n.eth_ip)}" target="_blank" rel="noopener">${esc(n.eth_ip)}</a>`:'')+
   (n.eth_conf&&n.eth_conf!=='exact'?` <span class="age">(${esc(n.eth_conf)})</span>`:'')+
   `</div>`:'';
- return `<div class="card${border}"><div class="k"><span class="badge ${cls}">${label}</span>
- <span class="ssidtag">ssid: <b>${esc(n.ssid||'-')}</b></span></div>
+ const swline=n.switch?`<div class="sub mono">Juniper ${esc(n.switch.port)}${n.switch.lldp_system?` <span class="age">(${esc(n.switch.lldp_system)})</span>`:''}</div>`:'';
+ const model=n.model?`<div class="sub">&#128197; ${esc(n.model)}</div>`:'';
+ return `<div class="card"${borderStyle}><div class="k"><span class="badge ${cls}">${label}</span>
+ <span class="ssidtag">ssid: <b>${esc(n.ssid||'-')}</b>${n.band?` <span class="sub">&middot; ${esc(n.band)}</span>`:''}</span>
+ ${sigBars(n.signal_dbm)}
+ ${pct!=null?`<span class="sub mono">${pct}%</span>`:''}</div>
  <div class="v mono">${esc(n.bssid||'-')}</div>
- <div class="sub">ch${n.chan??'-'} &middot; ${(n.signal_dbm??'?')} dBm &middot; rtt ${n.avg_rtt_ms??'-'}ms</div>
- ${t>0?`<div class="sub ${cc}">1h: ${m}/${t} probes missed</div>`:''}
+ <div class="sub" title="signal ${n.signal_dbm??'?'} dBm">ch${n.chan??'-'} &middot; rtt ${n.avg_rtt_ms??'-'}ms</div>
+ ${m>0?`<div class="sub" style="color:${ratioColor(r??(m/t))}">1h: ${m}/${t} probes missed</div>`:''}
  ${lan}
+ ${swline}
+ ${model}
  <div class="sub">${txt}</div>
  <div class="sub">probed ${ago(n.age_s)} ago</div></div>`;
 }
@@ -253,7 +431,8 @@ async function pollState(){
   const l=s.live;
   $('hdr').textContent=`live view of ${l.iface}`+
    (s.cycle.static_ipv4?` &middot; static ${s.cycle.static_ipv4}`:'')+
-   ` &middot; ${s.cycle.visit_items} node probes/sweep &middot; cycle ${s.cycle.cycle_interval_s}s `+
+   ` &middot; ${(s.radios_active||[]).length} radios &middot; ${s.cycle.visit_items} node probes/sweep &middot; cycle ${s.cycle.cycle_interval_s}s `+
+   (s.scan_perf?` &middot; sweep ${s.scan_perf.duration_s}s with ${s.scan_perf.radios} radio(s), +${s.scan_perf.improvement_pct}% vs single-radio (${s.scan_perf.solo_estimate_s}s solo)`:'')+
    `(${s.cycle.probe_count} probes / ${s.cycle.probe_interval_s}s) &middot; scan ${s.cycle.scan_interval_s}s`+
    (s.last_scan_age_s!=null?` &middot; last scan ${ago(s.last_scan_age_s)} ago`:'')+
    ` &middot; up ${ago(s.uptime_s)}`;
@@ -277,6 +456,55 @@ async function pollState(){
     <td>${esc(r.ssid)}</td><td class="mono">${esc(r.bssid||'-')}</td>
     <td>${r.avg_loss_pct??'-'}</td><td>${r.connects}/${r.visits}</td></tr>`).join('')+'</table>'
    :'<div class="sub">none</div>';
+  const rlabel=r=>!r.present?'GONE'
+   :((r.fails_shared??0)>=4||(r.consec_fail>=6&&(r.fails_shared??0)>=2))?'DYING'
+   :r.consec_fail>0?'FLAKY':'OK';
+  const rcls=r=>{const l=rlabel(r);return l==='OK'?'b-ok':l==='FLAKY'?'b-warn':'b-bad'};
+  $('apinv-h').textContent=`Physical APs (${(s.aps||{}).count??0})`;
+  const aps=s.aps&&s.aps.units?s.aps.units:[];
+  $('apinv').innerHTML=aps.length?
+   '<table><tr><th>name</th><th>model</th><th>ip</th><th>switch port</th><th>port traffic</th><th>bssids by band</th>'+
+   '<th>clients</th><th>uptime</th><th>source</th></tr>'+
+   aps.map(u=>{
+    const b=u.bands||{}, bands=Object.keys(b).sort().map(k=>`${b[k]} on ${k}`).join(', ')||'-';
+    const radios=(u.radios||[]).map(r=>{
+      if(r.band){
+        if(r.on===false)return `${r.band} radio off`;
+        const bits=[r.band];
+        if(r.chan)bits.push(`ch${r.chan}`);
+        if(r.util)bits.push(`(${r.util}%)`);
+        return bits.join(' ');
+      }
+      const bits=[];
+      if(r.chan)bits.push(`ch${r.chan}`);
+      if(r.ssid)bits.push(`"${r.ssid}"`);
+      if(r.on===false)bits.push('off');
+      if(r.clients!=null)bits.push(r.clients+' clients');
+      return bits.join(' ');
+    }).filter(s=>s).join(' | ');
+    const sw=u.switch?`${esc(u.switch.port)}${u.switch.lldp_system?` <span class="sub">${esc(u.switch.lldp_system)}</span>`:''}`:'-';
+    const fb=v=>v==null?'-':v>=1e6?(v/1e6).toFixed(1)+' Mbps':v>=1e3?(v/1e3).toFixed(0)+' kbps':v+' bps';
+    const tr=u.switch&&u.switch.in_bps!=null?`&darr; ${fb(u.switch.in_bps)} &uarr; ${fb(u.switch.out_bps)}`:'-';
+    return `<tr><td><b>${esc(u.name||'unnamed')}</b></td>
+     <td>${esc(u.model||'-')}${radios?` <span class="sub">${esc(radios)}</span>`:''}</td>
+     <td class="mono">${u.ip?`<a href="http://${esc(u.ip)}/" target="_blank" rel="noopener">${esc(u.ip)}</a>`:'-'}</td>
+     <td class="mono">${sw}</td>
+     <td class="mono">${tr}</td>
+     <td>${bands}</td>
+     <td>${u.clients??'-'}</td><td>${esc(u.uptime||'-')}</td>
+     <td class="sub">${esc(u.source||'-')}</td></tr>`}).join('')+'</table>'
+   :'<div class="sub">none yet — poll pending</div>';
+  $('radios').innerHTML=s.radios.length?
+   '<table><tr><th>adapter</th><th>state</th><th>visits</th><th>ok/fail</th>'+
+   '<th>streak</th><th>blamed</th><th>last ok</th><th>last scan</th><th>last error</th></tr>'+
+   s.radios.map(r=>`<tr><td class="mono">${esc(r.iface)}</td>
+    <td><span class="badge ${rcls(r)}">${rlabel(r)}</span></td>
+    <td>${r.visits??0}</td><td>${r.connect_ok??0}/${r.connect_fail??0}</td>
+    <td>${r.consec_fail||0}</td><td>${r.fails_shared??0}</td>
+    <td>${r.last_ok_age_s!=null?ago(r.last_ok_age_s)+' ago':'never'}</td>
+    <td>${r.last_scan_bss!=null?r.last_scan_bss+' bss, '+ago(r.last_scan_age_s)+' ago':'-'}</td>
+    <td class="sub">${esc((r.last_error||'').slice(0,60))}</td></tr>`).join('')+'</table>'
+   :'<div class="sub">no adapters yet</div>';
  }catch(e){$('dot').className='bad'}
 }
 
@@ -287,10 +515,6 @@ async function pollSeries(){
   s.signal.forEach(r=>{const k=`${r.bssid} ${r.ssid}`;
    (by[k]=by[k]||[]).push([r.epoch,r.dbm])});
   chart($('c-sig'),Object.entries(by).map(([label,pts])=>({label,pts})),true,'dBm');
-  const byL={};
-  s.loss.forEach(r=>{const k=`${r.bssid} ${r.ssid}`;
-   (byL[k]=byL[k]||[]).push([r.epoch,r.pct])});
-  chart($('c-loss'),Object.entries(byL).map(([label,pts])=>({label,pts})),false,'%');
  }catch(e){}
 }
 

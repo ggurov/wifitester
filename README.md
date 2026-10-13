@@ -51,21 +51,40 @@ signal-strength-over-time, loss-per-visit, and neighbor-signal charts.
 
 ## Layout / safety
 
+- **Auto-radio pool (recommended)**: set `tester.interfaces = "auto"` and
+  just plug/unplug USB wifi adapters — the tester discovers them at
+  runtime (joins within one sweep, leaves when removed, survives USB
+  re-enumeration renames via MAC-keyed lease cache). Radios carrying a
+  non-tester connection (your standing wifi) are never grabbed. Each new
+  radio grabs **DHCP once**, caches the lease by MAC (survives restarts)
+  and reuses that address on later activations — never-default keeps test
+  radios off the default route. Alternatively list interfaces explicitly
+  (legacy static mode: walk-down allocator from `static_ipv4`).
+- **Parallel sweeps, staggered scans**: each radio drains its node share
+  in its own thread (extra radios start offset by 4 s so identical
+  2.4 GHz sticks don't scan simultaneously — stacked identical EUS sticks
+  RF-jam each other; physically separate them too). The dashboard header
+  reports the measured parallel speedup: `sweep 56s with 3 radio(s),
+  +58% vs single-radio`.
+- **Wedged-radio auto-reset**: 4+ consecutive association timeouts on a
+  radio trigger a USB re-enumeration (max 2/hour) — fixes driver/firmware
+  wedges; RF-jammed sticks need physical separation instead (the board
+  tells you which via FLAKY/GONE badges and per-AP `radio_fails`).
 - **Per-BSSID probing**: configured APs expand into their `expected_bssids`
   and each mesh node gets its own pinned association + probe — the status
   page is one card per BSSID (sorted by BSSID), so a flaky node can't hide
   behind its SSID. Unpinned APs (or BSSIDs discovered later) are classified
   by the scan pass instead.
 - **Static addressing**: with `static_ipv4` set (all APs bridge the same
-  LAN), the tester profiles use manual IPv4/IPv6-off — no DHCP per visit,
-  settle drops to ~0.5 s. The address is arping-checked at startup.
-- One radio = sequential visits. Cadence is intentionally aggressive
-  (default: back-to-back sweeps, `cycle_interval_s = 5` — association time
-  alone paces it at ~5 s per node) to catch transient outages. Each visit
-  fires 3 fast pings (1 s deadline) so sub-second blips surface as loss.
-- Offline configured APs cost `connect_timeout_s` (15 s) per sweep; pin
-  verified BSSIDs (`expected_bssids`) to keep scan passes ~15 s instead of
-  ~2 min of PSK auth attempts.
+  LAN), the primary and static-mode radios use manual IPv4/IPv6-off — no
+  DHCP per visit, settle drops to ~0.5 s. The address is arping-checked at
+  startup. In auto mode extras use DHCP-once instead.
+- **Failure handling is layered**: connection budget `connect_timeout_s`
+  (25 s), failure backoff starts at the 3rd consecutive failure
+  (4 → 8 → … → 64 cycles), the dashboard shows amber FLAKY below 3
+  straight failures and DOWN only beyond, and connection failures
+  attributable to *our own radio* (another radio reached the same BSSID)
+  are excluded from an AP's missed-probe counts.
 - Tester-managed NetworkManager profiles are all named `wt-*`,
   `autoconnect=no`; your own profiles are never touched, and the original
   connection is restored when the tester stops (SIGINT/SIGTERM safe).
@@ -74,6 +93,40 @@ signal-strength-over-time, loss-per-visit, and neighbor-signal charts.
   Pi. Only disable this on a console-connected box.
 - PSKs live in `psk_file`s (or `psk`), never committed; `/etc/wifitester` is
   root-only.
+
+## Router & switch integration
+
+Every 5 minutes the tester also polls the management plane of the network
+gear and stores it in the datastore (`ap_inventory`, `switch_ports`,
+`port_traffic` tables), surfaced on the status page as **Physical APs**
+(name, model, IP with a link to its admin UI, switch port, per-band BSSID
+counts, port traffic, clients, uptime) and as the **switch port** on each
+node card.
+
+- **Juniper switch** (core of the LAN): SSH + Junos CLI —
+  `show ethernet-switching table` (MAC → port), `show lldp neighbors`
+  (port → device self-identification), `show interfaces ge-0/0/* media`
+  (per-port in/out rates). This is how APs are located physically: the
+  port column says which switch port each unit is patched into.
+- **Aruba Instant AP**: SSH (`show aps`, `show clients`) — model, radio
+  utilization, clients, uptime.
+- **ASUS units (asuswrt)**: SSH + `nvram` (model/firmware/radio state per
+  band). Note: newer-generation ASUS UIs (RT-AC86U/AX89-class) gate the
+  *web* login behind a captcha — enable SSH in Administration → System
+  instead; the collector uses SSH.
+- **Fios main router**: REST API mapped (`loginStatus.cgi` /
+  `login.cgi` with sha512/md5 token chain, see repo history) — DHCP lease
+  table pending; the web login gates automation.
+
+Credentials live in `/home/pi/.wifitester/creds.json` (0600, **outside the
+repo** — never commit):
+```json
+{"aruba":  {"host": "…", "user": "…", "password": "…"},
+ "juniper": {"host": "…", "user": "…", "password": "…"},
+ "asus":   [{"host": "…", "user": "…", "password": "…"}, …]}
+```
+A human-readable ops reference (device map, MACs, port assignments,
+quirks) lives next to it in `creds.md`.
 
 ## Install (Raspberry Pi OS)
 

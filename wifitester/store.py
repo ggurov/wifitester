@@ -1,6 +1,7 @@
 """Local SQLite datastore: every probe visit, scan observation and auth
 attempt lands here on the Pi. Schema v1."""
 
+import json
 import sqlite3
 import threading
 import time
@@ -12,6 +13,7 @@ CREATE TABLE IF NOT EXISTS visits (
   ts TEXT NOT NULL,             -- ISO8601 UTC
   epoch REAL NOT NULL,
   ssid TEXT NOT NULL,
+  iface TEXT,                   -- radio that made the visit
   bssid TEXT,
   chan INTEGER,
   freq_mhz INTEGER,
@@ -54,6 +56,68 @@ CREATE TABLE IF NOT EXISTS lan_neigh (
   epoch REAL NOT NULL,
   ts TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS radio_stats (
+  iface TEXT PRIMARY KEY,
+  first_seen REAL,              -- epoch first used as a test radio
+  last_seen REAL,               -- last sweep heartbeat
+  present INTEGER,              -- interface currently exists
+  visits INTEGER DEFAULT 0,
+  connect_ok INTEGER DEFAULT 0,
+  connect_fail INTEGER DEFAULT 0,
+  consec_fail INTEGER DEFAULT 0,
+  last_ok REAL,
+  last_fail REAL,
+  last_error TEXT,
+  last_scan_bss INTEGER,        -- BSSIDs seen in the last scan pass (primary)
+  last_scan REAL
+);
+CREATE TABLE IF NOT EXISTS ap_inventory (
+  unit_key TEXT PRIMARY KEY,    -- collector-unique unit id (source-ip)
+  source TEXT NOT NULL,         -- collector: aruba-ssh, fios-ui, ...
+  name TEXT, model TEXT, ip TEXT, wired_mac TEXT,
+  uptime TEXT, clients INTEGER,
+  radios_json TEXT,             -- [{band, chan, util}, ...]
+  last_seen REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS switch_ports (
+  mac TEXT PRIMARY KEY,         -- lowercase learned MAC
+  port TEXT NOT NULL,           -- Junos interface, e.g. ge-0/0/36
+  vlan TEXT,
+  lldp_port TEXT,
+  lldp_system TEXT,
+  last_seen REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS port_traffic (
+  port TEXT PRIMARY KEY,        -- Junos interface, e.g. ge-0/0/36
+  link TEXT,
+  in_bps INTEGER,
+  out_bps INTEGER,
+  in_bytes INTEGER,
+  out_bytes INTEGER,
+  last_seen REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS radio_leases (
+  mac TEXT PRIMARY KEY,         -- radio MAC (survives ifname renames)
+  ip TEXT NOT NULL,
+  expires REAL NOT NULL,        -- epoch
+  last_seen REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sweep_perf (
+  id INTEGER PRIMARY KEY,
+  ts TEXT NOT NULL,
+  epoch REAL NOT NULL,
+  radios INTEGER NOT NULL,
+  items_total INTEGER NOT NULL,
+  items_done INTEGER NOT NULL,
+  duration_s REAL NOT NULL,
+  visits_time_s REAL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS fios_leases (
+  mac TEXT PRIMARY KEY,         -- lowercase lease MAC
+  hostname TEXT, ip TEXT,
+  expires_raw TEXT,
+  last_seen REAL NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_visits_bssid ON visits(bssid, epoch);
 CREATE INDEX IF NOT EXISTS idx_visits_ssid ON visits(ssid, epoch);
 CREATE INDEX IF NOT EXISTS idx_scan_bssid ON scan_obs(bssid, epoch);
@@ -80,6 +144,14 @@ class Store:
         self.db.execute("PRAGMA busy_timeout=10000")
         self.db.execute("PRAGMA journal_mode=WAL")   # web readers + probe writer
         self.db.executescript(SCHEMA)
+        try:  # dbs created before radio attribution
+            self.db.execute("ALTER TABLE visits ADD COLUMN iface TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        try:  # dbs created before sweep-perf timing
+            self.db.execute("ALTER TABLE sweep_perf ADD COLUMN visits_time_s REAL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass  # column already exists
         self.db.commit()
 
     def close(self):
@@ -91,11 +163,12 @@ class Store:
         epoch, ts = now_pair()
         with self._lock:
             self.db.execute(
-                "INSERT INTO visits(ts,epoch,ssid,bssid,chan,freq_mhz,"
+                "INSERT INTO visits(ts,epoch,ssid,iface,bssid,chan,freq_mhz,"
                 "signal_dbm,gateway,connect_ok,connect_error,probes_sent,"
                 "probes_lost,loss_pct,avg_rtt_ms,max_rtt_ms,internet_ok) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (ts, epoch, rec.get("ssid"), rec.get("bssid"),
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (ts, epoch, rec.get("ssid"), rec.get("iface"),
+                 rec.get("bssid"),
                  rec.get("chan"), rec.get("freq_mhz"), rec.get("signal_dbm"),
                  rec.get("gateway"), 1 if rec.get("connect_ok") else 0,
                  rec.get("connect_error"), rec.get("sent"), rec.get("lost"),
@@ -128,6 +201,222 @@ class Store:
             self.db.commit()
 
     # -- readers ----------------------------------------------------------
+
+    def radio_heartbeat(self, iface, present, scan_bss=None):
+        """Sweep heartbeat: radio still in the pool and present; optionally
+        record the BSSID count of the last scan pass (primary only)."""
+        epoch, _ = now_pair()
+        with self._lock:
+            self.db.execute(
+                "INSERT INTO radio_stats(iface,first_seen,last_seen,present,"
+                "last_scan_bss,last_scan) VALUES (?,?,?,?,?,?) "
+                "ON CONFLICT(iface) DO UPDATE SET "
+                "last_seen=excluded.last_seen, present=excluded.present, "
+                "last_scan_bss=COALESCE(excluded.last_scan_bss, "
+                "radio_stats.last_scan_bss), "
+                "last_scan=COALESCE(excluded.last_scan, radio_stats.last_scan)",
+                (iface, epoch, epoch, 1 if present else 0,
+                 scan_bss, epoch if scan_bss is not None else None))
+            self.db.commit()
+
+    def radio_visit(self, iface, ok, error=None):
+        """Account one visit attempt made on radio `iface`."""
+        epoch, _ = now_pair()
+        with self._lock:
+            self.db.execute(
+                "INSERT INTO radio_stats(iface,first_seen,last_seen,present,"
+                "visits,connect_ok,connect_fail,consec_fail,last_ok,"
+                "last_fail,last_error) VALUES (?,?,?,1,1,?,0,?,?,?,?) "
+                "ON CONFLICT(iface) DO UPDATE SET "
+                "last_seen=excluded.last_seen, visits=visits+1, "
+                "connect_ok=connect_ok+excluded.connect_ok, "
+                "connect_fail=connect_fail+(1-excluded.connect_ok), "
+                "consec_fail=CASE WHEN excluded.connect_ok=1 THEN 0 "
+                "ELSE consec_fail+1 END, "
+                "last_ok=CASE WHEN excluded.connect_ok=1 THEN excluded.last_ok "
+                "ELSE last_ok END, "
+                "last_fail=CASE WHEN excluded.connect_ok=1 THEN last_fail "
+                "ELSE excluded.last_fail END, "
+                "last_error=excluded.last_error",
+                (iface, epoch, epoch, 1 if ok else 0, 0 if ok else 1,
+                 epoch if ok else None, epoch if not ok else None,
+                 (error or "")[:300] if not ok else None))
+            self.db.commit()
+
+    def radio_stats(self):
+        return self._rows("SELECT * FROM radio_stats ORDER BY iface")
+
+    def upsert_ap_inventory(self, rows):
+        epoch, _ = now_pair()
+        with self._lock:
+            for r in rows:
+                self.db.execute(
+                    "INSERT INTO ap_inventory(unit_key,source,name,model,ip,"
+                    "wired_mac,uptime,clients,radios_json,last_seen) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(unit_key) DO UPDATE SET "
+                    "source=excluded.source, name=excluded.name, "
+                    "model=excluded.model, ip=excluded.ip, "
+                    "wired_mac=excluded.wired_mac, uptime=excluded.uptime, "
+                    "clients=excluded.clients, "
+                    "radios_json=excluded.radios_json, "
+                    "last_seen=excluded.last_seen",
+                    (r["unit_key"], r["source"], r.get("name"),
+                     r.get("model"), r.get("ip"), r.get("wired_mac"),
+                     r.get("uptime"), r.get("clients"),
+                     json.dumps(r.get("radios", [])), epoch))
+            self.db.commit()
+
+    def ap_inventory(self):
+        return self._rows("SELECT * FROM ap_inventory ORDER BY ip")
+
+    def upsert_switch_ports(self, rows):
+        epoch, _ = now_pair()
+        with self._lock:
+            for r in rows:
+                self.db.execute(
+                    "INSERT INTO switch_ports(mac,port,vlan,lldp_port,"
+                    "lldp_system,last_seen) VALUES (?,?,?,?,?,?) "
+                    "ON CONFLICT(mac) DO UPDATE SET port=excluded.port, "
+                    "vlan=excluded.vlan, lldp_port=excluded.lldp_port, "
+                    "lldp_system=excluded.lldp_system, "
+                    "last_seen=excluded.last_seen",
+                    (r["mac"], r["port"], r.get("vlan"),
+                     r.get("lldp_port"), r.get("lldp_system"), epoch))
+            self.db.commit()
+
+    def switch_ports(self):
+        return self._rows("SELECT * FROM switch_ports ORDER BY port, mac")
+
+    def upsert_port_traffic(self, rows):
+        epoch, _ = now_pair()
+        with self._lock:
+            for r in rows:
+                self.db.execute(
+                    "INSERT INTO port_traffic(port,link,in_bps,out_bps,"
+                    "in_bytes,out_bytes,last_seen) VALUES (?,?,?,?,?,?,?) "
+                    "ON CONFLICT(port) DO UPDATE SET link=excluded.link, "
+                    "in_bps=excluded.in_bps, out_bps=excluded.out_bps, "
+                    "in_bytes=excluded.in_bytes, out_bytes=excluded.out_bytes, "
+                    "last_seen=excluded.last_seen",
+                    (r["port"], r.get("link"), r.get("in_bps"),
+                     r.get("out_bps"), r.get("in_bytes"), r.get("out_bytes"),
+                     epoch))
+            self.db.commit()
+
+    def port_traffic(self):
+        return self._rows("SELECT * FROM port_traffic ORDER BY port")
+
+    def upsert_fios_leases(self, rows):
+        epoch, _ = now_pair()
+        with self._lock:
+            for r in rows:
+                self.db.execute(
+                    "INSERT INTO fios_leases(mac,hostname,ip,expires_raw,"
+                    "last_seen) VALUES (?,?,?,?,?) "
+                    "ON CONFLICT(mac) DO UPDATE SET hostname=excluded.hostname,"
+                    "ip=excluded.ip, expires_raw=excluded.expires_raw, "
+                    "last_seen=excluded.last_seen",
+                    (r["mac"], r.get("hostname"), r.get("ip"),
+                     r.get("expires_raw"), epoch))
+            self.db.commit()
+
+    def fios_leases(self):
+        return self._rows("SELECT * FROM fios_leases ORDER BY ip")
+
+    def radio_lease_get(self, mac):
+        """Cached DHCP lease for a radio MAC: (ip, expires) or None."""
+        rows = self._rows(
+            "SELECT ip, expires FROM radio_leases WHERE mac = ?", (mac,))
+        return (rows[0]["ip"], rows[0]["expires"]) if rows else None
+
+    def radio_lease_set(self, mac, ip, expires):
+        epoch, _ = now_pair()
+        with self._lock:
+            self.db.execute(
+                "INSERT INTO radio_leases(mac,ip,expires,last_seen) "
+                "VALUES (?,?,?,?) ON CONFLICT(mac) DO UPDATE SET "
+                "ip=excluded.ip, expires=excluded.expires, "
+                "last_seen=excluded.last_seen",
+                (mac, ip, expires, epoch))
+            self.db.commit()
+
+    def insert_sweep_perf(self, radios, items_total, items_done, duration_s,
+                          visits_time_s=0.0):
+        epoch, ts = now_pair()
+        with self._lock:
+            self.db.execute(
+                "INSERT INTO sweep_perf(ts,epoch,radios,items_total,"
+                "items_done,duration_s,visits_time_s) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (ts, epoch, radios, items_total, items_done, duration_s,
+                 visits_time_s))
+            self.db.commit()
+
+    def sweep_perf(self, limit=20):
+        return self._rows(
+            "SELECT * FROM sweep_perf ORDER BY epoch DESC LIMIT ?", (limit,))
+
+    def radio_fail_triage(self, iface, since_epoch):
+        """Split a radio's recent connect failures into (solo, shared-blame).
+        A failure is shared-blame when some OTHER radio reached the same
+        BSSID fine within +/-1h -- the target was sick, not the adapter."""
+        rows = self._rows(
+            """SELECT EXISTS(
+                 SELECT 1 FROM visits v2
+                 WHERE v2.bssid = v1.bssid AND v2.connect_ok = 1
+                   AND v2.iface IS NOT NULL AND v2.iface != v1.iface
+                   AND v2.epoch BETWEEN v1.epoch - 3600 AND v1.epoch + 3600
+               ) AS blamed
+               FROM visits v1
+               WHERE v1.iface = ? AND v1.connect_ok = 0 AND v1.epoch >= ?""",
+            (iface, since_epoch))
+        solo = sum(1 for r in rows if not r["blamed"])
+        return solo, len(rows) - solo
+
+    def hour_fail_attributed(self, since_epoch):
+        """Per-BSSID hourly connection-failure accounting, split by blame:
+        {bssid: {"radio_fails": n, "solo_fails": n}}. A failed association
+        is radio_fails only when some OTHER radio reached the same BSSID
+        within ~5 min of the failure (the target demonstrably worked then).
+        Stale successes (window ±1h) wrongly excused failures of targets
+        that died mid-hour -- the exact skew that kept dead APs green."""
+        rows = self._rows(
+            """SELECT v1.bssid,
+                      SUM(CASE WHEN EXISTS(
+                            SELECT 1 FROM visits v2
+                            WHERE v2.bssid = v1.bssid AND v2.connect_ok = 1
+                              AND v2.iface IS NOT NULL
+                              AND v2.iface != v1.iface
+                              AND v2.epoch BETWEEN v1.epoch - 300
+                                              AND v1.epoch + 90
+                          ) THEN 1 ELSE 0 END) AS radio_fails,
+                      COUNT(*) AS total
+               FROM visits v1
+               WHERE v1.epoch >= ? AND v1.connect_ok = 0
+                 AND v1.bssid IS NOT NULL
+               GROUP BY v1.bssid""",
+            (since_epoch,))
+        return {r["bssid"]: {"radio_fails": r["radio_fails"],
+                             "solo_fails": r["total"] - r["radio_fails"]}
+                for r in rows}
+
+    def bssid_streaks(self, since_epoch):
+        """{bssid: consecutive failed visits} counting backwards from the
+        most recent visit per BSSID (a success resets the count)."""
+        rows = self._rows(
+            """SELECT bssid, connect_ok FROM visits
+               WHERE epoch >= ? AND bssid IS NOT NULL
+               ORDER BY epoch DESC""",
+            (since_epoch,))
+        streaks = {}
+        for r in rows:
+            b = r["bssid"]
+            if b not in streaks:
+                streaks[b] = 0 if r["connect_ok"] else 1
+            elif streaks[b] and not r["connect_ok"]:
+                streaks[b] += 1
+        return streaks
 
     def _rows(self, sql, args=()):
         with self._lock:
